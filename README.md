@@ -186,7 +186,7 @@ python scripts/check_bd_nets.py   # 引脚存在性 / 位宽 / 悬空输入
 
 每个算法模块的**单独端口图**（输入来源 / 输出去向 / 位宽）在
 [`docs/bd_images/`](docs/bd_images/) 下，也汇总成了一份 Word：
-`../BlockDesign算法模块与连接关系.docx`。
+[`docs/BlockDesign算法模块与连接关系.docx`](docs/BlockDesign算法模块与连接关系.docx)。
 
 **当前的 BD 状态**：`validate_bd_design` 通过、悬空输入 0 个、位宽全部匹配。
 其中 `vs_defaults` 是一个**故意设计**的占位块 —— Vivado 对未连接输入只会静默 tie 成 0，
