@@ -1,0 +1,7 @@
+# 默认自动识别文本/二进制；统一转 LF 入库，Windows 批处理保留 CRLF
+* text=auto
+*.bat text eol=crlf
+*.png binary
+*.jpg binary
+*.docx binary
+*.xsa binary
