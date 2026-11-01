@@ -1,0 +1,7 @@
+type,id,name,f_low_hz,f_high_hz,f_center_hz,taps
+fir_band,0,resp,0.15,0.6,0.3,1024
+fir_band,1,cardiac,0.8,2.0,1.264911,1024
+fir_band,2,cm,0.95,1.2,1.067708,1024
+dft_grid,0,resp,0.15,0.6,,91
+dft_grid,1,vr,1.0,1.833333,,201
+dft_grid,2,cardiac,0.8,2.0,,121

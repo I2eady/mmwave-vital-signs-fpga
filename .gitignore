@@ -1,8 +1,8 @@
 # ---------------------------------------------------------------------------
-# Vivado 工程输出：649 MB 里 645 MB 是这些，全部不入库
-# （工程由 tcl/build_all.tcl 一键重建，不需要提交 .xpr / .bd / runs）
+# Vivado 工程输出（几百 MB），全部不入库
+# 工程由 build/tcl/build_all.tcl 一键重建，不需要提交 .xpr / .bd / runs
 # ---------------------------------------------------------------------------
-prj/
+build/vivado/
 .Xil/
 *.jou
 *.log
@@ -19,6 +19,17 @@ prj/
 *.dmp
 webtalk*
 usage_statistics*
+
+# 综合/实现原始报告体积大且随器件版本变化；
+# build/reports/ 下由脚本挑出来的那几份要入库（见下方 ! 例外）
+*.rpt
+!build/reports/*.rpt
+
+# 上板产物：bit / xsa 由构建脚本拷到这里，属于本地生成物
+board/artifacts/
+
+# BD 框图导出（export_bd_diagram.tcl 生成）
+report/figures/bd_dataflow.*
 
 # ---------------------------------------------------------------------------
 # Python
