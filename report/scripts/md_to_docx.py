@@ -18,7 +18,7 @@ import sys
 
 from docx import Document
 from docx.enum.table import WD_TABLE_ALIGNMENT
-from docx.enum.text import WD_ALIGN_PARAGRAPH
+from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.shared import Pt, RGBColor, Cm
@@ -148,6 +148,24 @@ def add_code(doc, lines):
         set_run_font(r, MONO_FONT, 8.5, mono=True)
 
 
+def add_page_number(section):
+    """页脚居中页码"""
+    p = section.footer.paragraphs[0]
+    p.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = p.add_run()
+    set_run_font(run, CJK_BODY, 9, color=RGBColor(0x80, 0x80, 0x80))
+    fld_begin = OxmlElement("w:fldChar")
+    fld_begin.set(qn("w:fldCharType"), "begin")
+    instr = OxmlElement("w:instrText")
+    instr.set(qn("xml:space"), "preserve")
+    instr.text = " PAGE "
+    fld_end = OxmlElement("w:fldChar")
+    fld_end.set(qn("w:fldCharType"), "end")
+    run._r.append(fld_begin)
+    run._r.append(instr)
+    run._r.append(fld_end)
+
+
 def render(doc, md_lines, title):
     # 文档标题
     tp = doc.add_paragraph()
@@ -156,6 +174,7 @@ def render(doc, md_lines, title):
     set_run_font(r, CJK_FONT, 18, bold=True, color=ACCENT)
     tp.paragraph_format.space_after = Pt(14)
 
+    first_h1 = [True]
     i = 0
     n = len(md_lines)
     while i < n:
@@ -188,11 +207,16 @@ def render(doc, md_lines, title):
             level = len(m.group(1))
             txt = m.group(2).strip()
             if level == 1:
-                # 文件标题：用文档标题已表达，这里作为一级小节
+                # 一级标题 = 报告的大部分（一、二、三），另起一页
+                if first_h1[0]:
+                    first_h1[0] = False
+                else:
+                    pb = doc.add_paragraph()
+                    pb.add_run().add_break(WD_BREAK.PAGE)
                 p = doc.add_paragraph()
-                add_inline(p, txt, size=15, base_bold=True, color=ACCENT)
-                p.paragraph_format.space_before = Pt(10)
-                p.paragraph_format.space_after = Pt(6)
+                add_inline(p, txt, size=16, base_bold=True, color=ACCENT)
+                p.paragraph_format.space_before = Pt(6)
+                p.paragraph_format.space_after = Pt(10)
             elif level == 2:
                 p = doc.add_paragraph()
                 add_inline(p, txt, size=13, base_bold=True, color=ACCENT)
@@ -295,6 +319,9 @@ def main():
     style.element.rPr.rFonts.set(qn("w:eastAsia"), CJK_BODY)
 
     render(doc, md, title)
+    add_page_number(sec)
+    doc.core_properties.title = title
+    doc.core_properties.subject = "全国大学生嵌入式芯片与系统设计竞赛 · 设计报告章节"
 
     out = os.path.abspath(a.dst)
     os.makedirs(os.path.dirname(out), exist_ok=True)
