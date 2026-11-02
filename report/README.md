@@ -8,9 +8,10 @@
 | [`flow_diagram.html`](flow_diagram.html) | 数据流图（浏览器打开即可，不必装 Vivado） | ③ |
 | [`vivado_guide.md`](vivado_guide.md) | Vivado 流程总览：从建工程到导出 `.xsa`，以及 PS 端要做什么 | ④ |
 | [`vivado_click_through.md`](vivado_click_through.md) | 逐条打勾的手动点击清单（78 步），不想用脚本时照这个点 | ⑤ |
-| [`llm_collaboration.md`](llm_collaboration.md) | **大模型协作记录**：需求拆解、每轮报错的根因、修复与判据 | ⑥ |
+| [`llm_collaboration.md`](llm_collaboration.md) | **大模型协作记录**（提示词 / 模型回答与自我纠错轨迹 / 智能体工作流设计）+ **技能包提炼过程**（从哪些失败总结、如何验证有效、边界如何确定） | ⑥ |
 | [`figures/`](figures/) | 模块图 PNG（19 张）+ `nets.md` 连线总表 | — |
-| [`scripts/`](scripts/) | `gen_bd_doc_assets.py`（从真实端口与连线自动画图）/ `gen_bd_doc_html.py`（组装成 Word 用 HTML） | — |
+| [`collaboration_and_skill.docx`](collaboration_and_skill.docx) | 上面两份内容的 Word 版，可直接并入项目书 | — |
+| [`scripts/`](scripts/) | `gen_bd_doc_assets.py`（从真实端口与连线自动画图）/ `gen_bd_doc_html.py`（组装成 Word 用 HTML）/ `md_to_docx.py`（Markdown → Word） | — |
 
 ## 图是怎么来的
 
@@ -24,6 +25,8 @@
 ```bash
 python report/scripts/gen_bd_doc_assets.py    # 出图 + nets.md
 python report/scripts/gen_bd_doc_html.py      # 组装 report/figures/doc.html
+python report/scripts/md_to_docx.py report/llm_collaboration.md \
+    report/collaboration_and_skill.docx --title "大模型协作记录与技能包提炼过程"
 ```
 
 ## 提交材料对应关系
@@ -31,6 +34,7 @@ python report/scripts/gen_bd_doc_html.py      # 组装 report/figures/doc.html
 | 竞赛要求 | 对应文件 |
 |---|---|
 | 设计报告 | `design_report.md` + `bd_structure.md` |
-| 大模型协作记录 | `llm_collaboration.md` |
+| 大模型协作记录 | `llm_collaboration.md` §0–§3 |
+| 技能包提炼过程 | `llm_collaboration.md` §4 + [`../skill/README.md`](../skill/README.md) |
 | 设计框图 / 数据流 | `bd_modules_and_nets.docx`、`flow_diagram.html`、`figures/` |
 | 完整源码与工程 | `src/`、`build/` |

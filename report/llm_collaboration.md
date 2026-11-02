@@ -1,435 +1,496 @@
-> **这是开发过程中的工作版记录**（含报错对照表、逐轮修复过程、剩余待办）。
-> 项目总览请看仓库根目录的 [`README.md`](../README.md)。
+# 大模型协作记录
 
-# IWR6843 毫米波雷达非接触心率估计 —— ZYNQ7020 FPGA 实现
+> 对应选题指南 3.3.5.3「设计报告」中的**大模型协作记录**与**技能包提炼过程**两节。
+> 技能包本体见 [`../skill/README.md`](../skill/README.md)。
 
-把 `python代码/scr/` 中的算法流水线（机器人载具 + IWR6843 雷达心率监测）
-移植为可在 **Xilinx ZYNQ-7020（xc7z020clg400-2）** 上综合的 Verilog 实现，
-并提供完整的 **Vivado Block Design** 图形化数据流。
+## 0. 协作概览
 
----
+本项目的 RTL、Block Design 脚本、校验脚本与全部文档由人机协作完成。分工不是"人提需求、模型写代码"，
+而是**人持有执行权与最终裁决权，模型持有检索、生成与推理能力，两者通过"日志—判据"闭环耦合**。
 
-## 0. 当前状态
+| 角色 | 人 | 大模型（智能体） |
+|---|---|---|
+| 环境 | 唯一能运行 Vivado 与上板的一方 | 只能读仓库、跑 Python、做静态分析 |
+| 输入 | 需求、约束、实跑日志、现象描述 | 仓库源码、日志文本、公开文档 |
+| 输出 | 判据确认、方案取舍、验收 | 代码、脚本、文档、根因假设 |
+| 裁决 | 最终以实跑结果为准 | 以"能否被证据证伪"为准 |
 
-| 项 | 状态 |
+一次典型循环：
+
+```
+人：贴一段带 ERROR 的构建日志
+      ↓
+模型：提出根因假设 → 在日志/生成产物里找反驳证据 → 定位到具体行
+      ↓
+模型：给出最小修复 + 一句"你该看到什么"的预期
+      ↓
+人：跑一次 → 贴新日志（判据成立 / 不成立）
+      ↓
+模型：把这次错误沉淀成一条 lint 规则或一条踩坑条目
+```
+
+**全部协作共 20 余轮迭代，其中 6 轮由实跑日志驱动。** 每一轮只改一类错误，
+保证"日志变了"能唯一归因，这是后面所有结论可信的前提。
+
+## 1. 智能体工作流设计
+
+### 1.1 五阶段流程
+
+| 阶段 | 输入 | 动作 | 输出 | 通过判据 |
+|---|---|---|---|---|
+| W1 事实建仓 | 原始 Python 代码、已有工程 | 读 `config.py`/`dsp.py`/`estimator.py`，反查器件型号与 Vivado 版本 | 算法阶段清单、定点规格草案 | 每个阶段都有对应的 Python 函数与调用顺序 |
+| W2 规格映射 | 阶段清单 | 逐阶段决定定点格式、存储映射、并行/串行 | 模块划分 + 接口位宽表 | 每个模块的输入输出能被上游/下游唯一确定 |
+| W3 生成与自检 | 接口表 | 写 RTL/脚本 → **立即跑本地静态检查** | 代码 + 检查输出 | 静态检查 0 问题（不依赖 Vivado） |
+| W4 实跑归因 | 用户日志 | 定位**第一个** ERROR，找证据行，给最小修复 | 修复 + 预期现象 | 修复后日志中该 ERROR 消失且不引入新 ERROR |
+| W5 沉淀 | 本轮全部错误 | 判断是"一次性失误"还是"可复现的坑" | 检查器规则 / 踩坑条目 / 模板 | 下次同类错误能在 W3 阶段被拦下 |
+
+W5 是整个工作流的关键：**不是修完就算结束，而是要让同类错误下次在秒级阶段被拦住**。
+本项目的两个静态检查器（`sim/scripts/*.py`）就是这么长出来的——它们不是预先设计的，
+而是每一轮踩坑后追加的规则集合。
+
+### 1.2 三条工作规则
+
+**规则一：事实分层。** 三类信息可靠性递减，冲突时以高位为准：
+
+```
+仓库事实（源码、生成产物、报告文件）  >  用户实跑日志  >  模型先验知识
+        ↑ 可直接读                    ↑ 唯一外部真相        ↑ 最容易错，且错得很自信
+```
+
+本项目中模型先验出错的典型：`axi_protocol_converter` 的属性名，模型"记得"是
+`C_S_AXI_PROTOCOL`，实际是 `SI_PROTOCOL`（见 §3 案例 D）。
+
+**规则二：可证伪优先。** 任何根因假设必须能指出一条"如果假设成立，就应该在日志/文件里看到 X"。
+做不到这一点的假设不写进结论。例如判断"模块引用是否走了 OOC 综合"，
+不是靠讨论，而是去看 `ip/vs_bd_fir_resp_0_0/` 下有没有 `*_ooc.xdc` —— 没有，就说明没走 OOC，
+`$readmemh` 的搜索路径不是问题（见 §3 案例 D）。
+
+**规则三：秒级预检先行。** 凡是能在本地几秒内查出的问题，绝不放到 Vivado 里查（分钟级）。
+这条规则直接决定了工具形态：写两个 Python 检查器，而不是反复让人跑 20 分钟的流程。
+
+### 1.3 单一事实来源
+
+| 对象 | 唯一事实来源 | 反例（会产生不一致） |
+|---|---|---|
+| Block Design 结构 | `build/tcl/build_bd.tcl` | 在 GUI 里手改 `.bd` 后不回写脚本 |
+| 模块图与连线表 | `report/scripts/gen_bd_doc_assets.py`（解析端口 + 脚本连线生成） | 手工画图、手工列表 |
+| ROM 初值 | `build/scripts/gen_rom.py` | 直接改 `.mem` |
+| 报告里的资源数字 | `build/reports/*.rpt` | 手抄到文档后不标注来源 |
+
+文档全部由脚本从工程里生成，是"让模型不产生幻觉"最有效的手段：
+**模型没有机会在文档里写错一个位宽，因为它没有手写这些位宽的环节。**
+
+### 1.4 工作流的自我调整
+
+最初的工作流是"探测 → 生成"：先写一个探测脚本摸清 Vivado 的接口推断行为，再动手。
+**第一次探测就失败了**——本会话的执行环境里 Vivado 批处理会在加载器阶段卡死
+（`-version` 正常，`-mode batch` 停在加载器不再推进，沙箱内外一致，换 `winpty`、
+直接调 `unwrapped/win64.exe`、手动设 `RDI_*` 环境变量都无效）。
+
+用户当时的要求是：
+
+> 「你这个探测脚本运行时间过长了，我需要你先把整体框架迅速给我搭起来，每部分代码生成然后例化模块然后在连接，
+> 如果探测半天不出结果就别探测了」
+
+这直接触发了工作流改造：
+
+| 改造前 | 改造后 |
 |---|---|
-| RTL 模块（25 个 `.v`，17 个进 BD） | ✅ 完成，静态检查通过（关键字配平 / 例化端口 / ROM 文件） |
-| 顶层例化 `vital_signs_top.v` | ✅ 完成（单块集成版，未进 BD） |
-| **Block Design `vs_bd`** | ✅ **已在 Vivado 2019.1 实测跑通**：28 个单元全部创建成功、连线完成、`validate_bd_design OK`、`generate_target` 生成完毕；**悬空输入 0 个（BD 41-759 已消失）、位宽全部匹配（BD 41-1228 已消失）** |
-| **结构说明** | ✅ **见 [`report/bd_structure.md`](bd_structure.md)** —— 28 个单元清单、数据流 8 级、核心算法在哪 11 个文件、逐模块资源实测 |
-| ROM 初值 `build/scripts/gen_rom.py` | ✅ 已生成（正弦表 / FIR 系数 / 频率网格） |
-| 单元 testbench（4 个） | ✅ 完成 |
-| 数据流图 `report/flow_diagram.html` | ✅ 完成，可直接打开查看 |
-| **综合** | ✅ 通过（各模块 OOC 综合均成功） |
-| **实现（place/route）** | ❌ `place_design` 失败：**设计比 ZYNQ7020 大 3.7 倍**（LUT 197644 / 53200、FF 109255 / 106400、LUT 当 RAM 48000 / 17400、**BRAM 用量 0**）。原因与逐条修法见 `report/bd_structure.md` 第六节 |
+| 探测工具行为 → 再设计 | 先按约定生成，把**假设显式写在注释里**，用实跑验证 |
+| 交付 `.xpr` 工程 | 交付**一键脚本**（工程可从零重建，不需要二进制产物） |
+| 模型自己跑工具验证 | 模型做**静态验证**，把"唯一需要工具"的环节交给人 |
 
-> **资源超标的根因（已定位，不是算法架构问题）**：1.15 Mbit 的 600×80 窗口存储器
-> 被实现成了**分布式 RAM**（48000 个 LUT），而不是 BRAM —— 因为
-> `integrate_detrend.v` 的 `S_APPLY` 状态里 `ap_val = mem[ap_idx]` 是**组合读**，
-> BRAM 做不到异步读。同模块还有 44130 个纯逻辑 LUT（组合除法器 `ap_idx/N_CH` +
-> `mean_r[c]`/`slope_r[c]` 的 80:1 组合多路选择器）。
-> 另有大数组被实现成触发器（FIR `samp_buf` 14400×2、`peak_argmax.vals` 8192、
-> `spectrum_accum.mem` 8192）——**这一批已用 `ram_style` 属性修掉，省约 46k FF**。
+这次改造的收益是反直觉的：**因为不能自己跑，反而被迫把校验逻辑写成了可复用的脚本**，
+也就是后来技能包里的 SK-01 与 SK-02。如果模型能一直自己跑 Vivado，这两个脚本大概永远不会被写出来。
 
+## 2. 提示词
 
-> BD 的 28 个单元 = **19 个算法模块**（16 个原有 + `bpm_map` / `ratio_q15` / `vs_defaults`）
-> + 6 个 Xilinx IP（PS7 / DMA / SmartConnect / GPIO / 协议转换器 / 复位）
-> + 3 个 `xlconstant`（频带 / 网格选择）。
+下面 6 条是协作中实际使用并反复验证过的提示词模板。"效果"一列只写可观察的结果，不写主观评价。
 
-> **关于"我这边跑 Vivado"**：本会话所在的受管 shell 无法驱动 Vivado 2019.1 的
-> 批处理模式（`vivado.bat -mode batch -source ...` 会卡在加载器阶段，
-> `-version` 正常、沙箱内外表现一致）。因此工程构建改为**一键脚本**形式交付，
-> 在您本机的 cmd 里执行即会生成 `build/vivado/vs_fpga.xpr` 与 `vs_bd` Block Design。
-RTL 与连线侧我做了两个**无依赖的静态检查器**（见 3.5 节），其中
-`sim/scripts/check_bd_nets.py` 会解析 RTL 端口位宽 + `build_bd.tcl` 的全部 `vs_net` 连线，
-在不开 Vivado 的前提下预演"引脚存在性 / 位宽一致性 / 悬空输入"三类检查——
-上面那 34 个悬空输入就是这么找出来并一次性接完的。
+### P1 需求压缩：用"最小可运行闭环"替代探索
 
----
+> 「不要先探测。先把整体框架搭起来：每部分代码生成、例化模块、再连线。
+> 如果探测几分钟出不来结果就放弃探测。」
+>
+> 附加约束：给出目录结构、模块清单、每一步的**判据**（我该看到什么）。
 
-## 1. 一眼看全：目录结构
+* **使用场景**：工具链行为未知、且一次实跑代价高（本项目单轮 1–25 分钟）。
+* **为什么这么写**：把"探索"改成"生成 + 显式假设"，假设写在注释里，后续用日志一次性否证。
+* **效果**：从"卡在探测"转为 40 分钟内产出 22 个模块 + 可执行的构建脚本。
+* **失效条件**：当工具行为会**改变架构**（而不是只影响实现细节）时不能这么跳，
+  例如若 Vivado 根本不支持 module reference，整个 BD 方案就要换，这时必须先探测。
+
+### P2 日志定位：只问第一个 ERROR 的根因
+
+> 「这是完整构建日志。请定位**第一个** ERROR 的根因，给出支撑它的日志行（原文引用），
+> 再给最小修复。不要一次改多处。」
+
+* **使用场景**：贴日志求助。
+* **效果**：6 轮日志中，每轮都把"改哪里"从 20 多个可疑点收敛到 1 个。
+* **失效条件**：多个错误有共同上游时（如编码问题导致的连锁报错），
+  "第一个 ERROR"可能是假象，需要先看有没有更早的 WARNING 或异常输出。
+
+### P3 报告驱动优化：让资源问题可归因
+
+> 「读 `synth_1/*_utilization_synth.rpt` 与各模块的 OOC 报告，按层次列出 LUT/FF/BRAM/DSP 占比，
+> 指出前三名，并分别说明它们为什么会被实现成这个形态（组合读？变量索引？没有 ram_style？）。」
+
+* **使用场景**：资源超标、时序不收敛。
+* **效果**：定位到"窗口存储器被实现成 48 000 个 LUTRAM"这一条（见 §3 案例 F），
+  而不是泛泛地"设计太大"。
+* **失效条件**：顶层报告为 0 时（模块引用各自 OOC 综合）必须去读**各模块自己的报告**，
+  否则会得出"设计没用资源"的错误结论。
+
+### P4 事实校验：禁止凭记忆写 API
+
+> 「凡是 `set_property`，先 `list_property` 枚举真实属性名再设置，设置后 `get_property` 回读；
+> 不要用你记得的属性名。」
+
+* **使用场景**：调用任何工具的配置接口。
+* **效果**：把"静默失败"变成"显式失败"（见 §3 案例 D）。这条后来写进了
+  `build/tcl/build_bd.tcl` 的 `set_any` 过程，成为代码而非提示词。
+* **失效条件**：属性存在但语义不同（如 `DATA_WIDTH` 在转换器上主从共用），
+  枚举能查到名字却查不到语义，仍需读文档或用现象反推。
+
+### P5 文档生成：只允许"从工程派生"
+
+> 「根据 RTL 的真实端口声明和 build_bd.tcl 的真实连线，生成每个模块的单独图和连接关系表，
+> 不要手画、不要凭印象补充。生成脚本要能重跑。」
+
+* **使用场景**：出图、出表、写文档。
+* **效果**：19 张模块图 + 129 条连线表全部可重生成，改完 RTL 重跑即同步。
+* **失效条件**：BD 若是手工在 GUI 里改的，脚本解析的连线就不是真实拓扑，必须先回写脚本。
+
+### P6 交付形式：按对方的 shell 写命令
+
+> 「我在 PowerShell 里，`cd /d` 和直接敲 `build_vivado.bat` 都报错。」
+
+* **使用场景**：交付操作步骤。
+* **效果**：暴露了"模型默认按 cmd 写命令"的偏差，之后所有操作步骤同时给 cmd 与 PowerShell 两版。
+* **失效条件**：无（纯表述问题），但**必须由用户的实际报错来触发**，
+  模型自己不会想到去问"你用哪个 shell"。
+
+## 3. 模型回答与自我纠错轨迹
+
+### 3.1 纠错统计
+
+| 轮次 | 触发 | 错误类别 | 定位耗时 | 是否一次修对 |
+|---:|---|---|---|---|
+| 1 | 实跑日志 | 编码 + `include` | 1 轮 | 否（只修了 `include`） |
+| 2 | 实跑日志 | 保留字 + 非法字面量 | 1 轮 | 是 |
+| 3 | 实跑日志 | 连线（IP 引脚名 / AXI 协议 / 普通流） | 1 轮 | 是 |
+| 4 | 实跑日志 | 属性名 + 数据宽度 | 1 轮 | 是 |
+| 5 | 实跑日志 | 不存在的属性 + 34 个悬空输入 | 1 轮 | 是 |
+| 6 | 综合报告 | 存储器映射导致资源超量 | 2 轮 | 部分 |
+| — | 代码自审 | 位宽截断（4 处，工具查不出） | — | 是 |
+
+12 类根因中，**9 类由日志/报告直接暴露，3 类只能靠读代码发现**。后者是工作流的能力边界，见 §4.4。
+
+### 3.2 案例 A：错误归因（把两个 bug 当成一个）
+
+**现象**：首次构建到第 3 个单元时中断，`catch` 到的 `$e` 是**空字符串**，
+且整段输出中文全是 `闃舵??`。
+
+**初始假设（错）**：只有一个 bug，即 `hampel7.v` 里的 `` `include "vs_params.vh" `` 解不开。
+
+**证伪过程**：日志里前两个单元 `radar_frame_if_0`、`dacm_phase_0` 是 `OK` 的，
+而这两个文件恰好**没有** `include`；第 3 个有 `include` 就挂——这支持了假设。
+但同时注意到更早的异常：所有中文提示都是乱码，说明**脚本根本没被正确解码**。
+两个问题必须分开修，否则修好一个仍会看到乱码，容易误判为"没修好"。
+
+**正解**：
+1. 编码 —— Vivado 的 Tcl 在中文 Windows 上按系统代码页（GBK）读取脚本文件，
+   UTF-8 中文被解错。全部 `.tcl`/`.bat` 改为**纯 ASCII**。
+2. `include` —— Block Design 的 `create_bd_cell -type module -reference` 走的是**另一个 HDL 解析器**，
+   不认 `include_dirs`。删除 `vs_params.vh`，把 16 个宏内联成字面量，全工程 **0 个 `` `include ``**。
+
+**沉淀**：编码 → SK-08 规则 1；`include` → SK-03 第 2 条；两条都进了 `rtl_lint.py` 的检查项。
+
+**教训**：`catch` 把异常吞成空串时，**报错信息本身也是信息**——它为空，说明错误发生在
+"取返回信息之前"，即建单元阶段就已经失败，而不是后续连线失败。
+
+### 3.3 案例 B：Verilog 的两个"看起来没问题"的写法
+
+**现象**：
 
 ```
-mmwave-vital-signs-fpga/
-├── README.md                    项目简介 + 复现步骤
-├── src/
-│   ├── rtl/                     可综合 Verilog（25 个 .v）
-│   │   ├── common/              u_div / median7 / sin_lut
-│   │   ├── frontend/            radar_frame_if / dacm_phase / hampel7 / integrate_detrend
-│   │   ├── spatial/             bin_selector / robot_motion_if
-│   │   ├── filter/              fir_bandpass / iir_biquad / biquad_cascade / biquad_coeff_rom
-│   │   ├── spectral/            goertzel_sweep / null_model_cancel / spectrum_accum
-│   │   │                        / peak_argmax / ratio_q15 / cm_ref_extract
-│   │   ├── cert/                certificate_fsm
-│   │   ├── output/              result_out
-│   │   └── top/                 vs_engine_fsm / bpm_map / vs_defaults / vital_signs_top
-│   └── ps/README.md             PS 侧寄存器映射与 DMA 时序
-├── sim/
-│   ├── tb/                      4 个单元 testbench
-│   ├── tcl/run_sim.tcl          批量跑仿真
-│   ├── scripts/                 rtl_lint.py / check_bd_nets.py（无 Vivado 依赖）
-│   └── results/                 仿真与检查结果记录
-├── build/
-│   ├── build_vivado.bat         一键入口
-│   ├── tcl/                     build_everything / build_all / build_bd / wire_only
-│   │                            / build_after_bd / export_bd_diagram
-│   ├── scripts/                 gen_rom.py（生成 .mem）/ export_tables.py（导出 CSV）
-│   ├── reports/                 综合与实现报告归档
-│   └── vivado/                  Vivado 工程（本地生成，不入库）
-├── board/
-│   ├── README.md                上板流程、串口协议、实测记录
-│   └── artifacts/               bit / xsa（本地生成，不入库）
-├── data/
-│   └── rom_tables/              FIR 系数、DFT 网格、正弦表的 CSV 参考值
-├── skill/README.md              工程技能包：改哪里、怎么验证、别踩什么
-└── report/
-    ├── design_report.md         设计报告：Python→Verilog 逐阶段映射、定点规格、近似点
-    ├── bd_structure.md          Block Design 结构：28 个单元、数据流、核心算法定位
-    ├── bd_modules_and_nets.docx 19 张模块图 + 连带关系表（Word）
-    ├── flow_diagram.html        数据流图（浏览器直接打开）
-    ├── vivado_guide.md          Vivado 流程总览
-    ├── vivado_click_through.md  逐条打勾的手动点击清单
-    ├── llm_collaboration.md     本文件：与大模型协作的过程记录
-    ├── figures/                 模块图 PNG + 连线总表
-    └── scripts/                 从真实端口与连线自动生成图与表的脚本
+CRITICAL WARNING: [HDL 9-806] Syntax error near "buf".   [fir_bandpass.v:76]
+CRITICAL WARNING: [HDL 9-806] Syntax error near "(".     [fir_bandpass.v:106]
 ```
 
-> **另有一份 Word 交付物**：`report/bd_modules_and_nets.docx`
-> （19 张模块图 + 1 张总览图 + 129 条连线总表，共 35 个标题 / 13 张表 / 20 张图）。
-> 改完 RTL 后重跑 `report/scripts/gen_bd_doc_assets.py` + `gen_bd_doc_html.py` 即可刷新图与表。
+**根因一**：`buf` 是 Verilog 的**内建门级原语名**（与 `not`/`and`/`or`/`tran`/`nmos` 同类），
+不能作标识符。变量名叫 `buf` 在语义上毫无问题，在语法上直接非法。
 
----
+**根因二**：`32'sd(NTAP-1)`。Verilog 的 sized literal 后面只能跟简单数字，
+**不能跟括号表达式**，必须先算成 `localparam`。
 
-## 2. 数据流（Block Design 呈现的就是这张图）
+**沉淀**：两条都写进 `rtl_lint.py`（保留字扫描 + sized literal 后跟括号的扫描）。
 
-```
-                          ┌──────────────────────────────┐
-   PS(ARM) ──DMA MM2S──▶  │        radar_frame_if        │  打通道号 / 开 30s 分析窗
-                          └───────────────┬──────────────┘
-                                          ▼  32bit {Q,I}
-                          ┌──────────────────────────────┐
-                          │          dacm_phase          │  dφ=(I·dQ−Q·dI)/(I²+Q²)
-                          └───────────────┬──────────────┘
-                                          ▼  24bit Q4.20
-                          ┌──────────────────────────────┐
-                          │           hampel7            │  窗 7 中值 + MAD
-                          └───────────────┬──────────────┘
-                                          ▼
-                          ┌──────────────────────────────┐
-                          │      integrate_detrend       │  积分 + 线性去趋势
-                          │   [ 600×80×24b 窗口存储器 ]   │  ← 后续所有引擎的数据源
-                          └───────┬──────────────┬───────┘
-                                  ▼              ▼
-                     ┌─────────────────┐  ┌─────────────────┐
-                     │   fir_resp      │  │   fir_card      │
-                     │ 0.15–0.60 Hz    │  │ 0.80–2.00 Hz    │
-                     └────────┬────────┘  └────────┬────────┘
-                              ▼                    ▼
-                     ┌─────────────────┐  ┌──────────────────────┐
-                     │ goertzel_resp   │  │  null_model_cancel   │
-                     │  91 点 0.005Hz  │  │ 呼吸谐波 k=2..12 LMS │
-                     └────────┬────────┘  │      + 共模参考       │
-                              │           └──────────┬───────────┘
-                              │                      ▼
-                              │           ┌──────────────────────┐
-                              │           │    goertzel_vr       │
-                              │           │ 201 点 60–110 bpm    │
-                              │           │     步长 0.25 bpm     │
-                              │           └──────────┬───────────┘
-                              ▼                      ▼
-                     ┌─────────────────────────────────────┐
-                     │          spectrum_accum             │ 跨 (bin,RX) 非相干累加
-                     └─────────────────┬───────────────────┘
-                                       ▼
-                     ┌─────────────────────────────────────┐
-                     │            peak_argmax              │ argmax + 抛物线 + 峰/中位
-                     └─────────────────┬───────────────────┘
-                                       ▼
-                     ┌─────────────────────────────────────┐
-                     │          certificate_fsm            │ MEASURE / LOW_CONF / REJECT_*
-                     └─────────────────┬───────────────────┘
-                                       ▼
-   PS(ARM) ◀──AXI4-Lite + IRQ──  result_out
+**教训**：这两类错误**编译期就报，但报错信息极差**（只说 `near "buf"`，不说 `buf` 是关键字）。
+把它们变成 lint 规则后，同类错误在毫秒级暴露，不必再进 Vivado。
 
-   旁路：
-     axi_gpio ──▶ robot_motion_if ──┬──▶ bin_selector ──▶ 候选仓掩码 ──▶ vs_engine
-                                    └──▶ motion_reject ──▶ certificate_fsm
-     vs_engine_fsm ──▶ 所有引擎的 start/done 握手（唯一的控制中枢）
+### 3.4 案例 C：位宽截断——四个工具查不出的静默错误
+
+这是本项目**唯一一类"没有任何报错"的错误**，也是最能说明"模型自审不可替代"的案例。
+
+```verilog
+// 错：Verilog 的乘法位宽按 max(左值, 操作数) 计算，16 位上下文里 3072*32767 直接溢出
+wire [15:0] p = (contrast_db_q8 * 16'd32767) / 16'sd3072;
+
+// 错：右值只有 24 位，乘积被截断后再右移 22 位，结果恒为 0，LMS 权重永远不更新
+w_s[t] <= w_s[t] + ((e_s * sin_v[t+1]) >>> MU_SHIFT);
+
+// 对：先算进 48 位中间量，再收窄
+upd0 = ($signed(e_s) * $signed(sin_v[t+1])) >>> MU_SHIFT;
+w_s[t] <= w_s[t] + upd0[23:0];
 ```
 
----
+同类问题共 4 处：`null_model_cancel` 的 LMS 更新、`certificate_fsm` 的质量分除法、
+`hampel7` 的阈值乘积、`goertzel_sweep` 的 ROM 越界（数组 768 项、索引可到 1023）。
 
-## 3. 快速开始
+**为什么工具查不出**：综合器不会对无符号/有符号混算、上下文宽度导致的截断报错，
+它"忠实"地实现了错误语义。仿真若无对照激励也看不出来（输出是稳定值，只是错的）。
 
-### 3.1 生成 ROM 初值（已生成，改参数后需重跑）
+**因此这一轮的产出是**：`skill/README.md` 里一条硬规则——
+"凡是要保留高位的乘法，必须先赋给足够宽的中间量"，并给出正反例。
+它不是脚本能查的（需要数据流分析），只能作为**代码评审清单**存在。
+这也是本工作流明确的边界，见 §4.4。
 
-```bash
-cd fpga/scripts
-python gen_rom.py        # 需要 numpy + scipy
+### 3.5 案例 D：被 `catch` 掩盖的"成功"
+
+**现象**：脚本打印了 `axi_pc : S=AXI4 M=AXI3`，看起来设置成功；但后续校验仍报协议不兼容，
+并在日志里夹着一行：
+
+```
+CRITICAL WARNING: [BD 41-1276] Cannot set the parameter C_S_AXI_PROTOCOL on /axi_pc.
+                  Parameter does not exist
 ```
 
-生成：`src/rtl/common/sin_lut.mem`、`src/rtl/spectral/sin_lut.mem`、
-`src/rtl/filter/fir_coeff.mem`、`src/rtl/filter/coeff_rom.mem`、`src/rtl/spectral/dft_delta.mem`
+**根因**：属性名是 `CONFIG.SI_PROTOCOL` / `CONFIG.MI_PROTOCOL`（GUI 上叫 SI Protocol / MI Protocol）。
+模型记得的名字（`C_S_AXI_PROTOCOL`）来自另一个 IP 的命名习惯。
 
-### 3.2 一条命令全做完 ★
+**更危险的地方**：`set_property` 写错属性名**不报错、不中断脚本**，只给一条 CRITICAL WARNING，
+所以包在 `catch` 里的写法和"成功"长得一模一样。
 
-**在 cmd 里：**
-
-```bat
-cd /d D:\A_university_project\FPGAmmwave\fpga
-build/build_vivado.bat
-```
-
-**在 PowerShell 里：** 注意两点 —— `cd` 不要加 `/d`（那是 cmd 的写法），
-当前目录下的脚本必须加 `.\` 前缀：
-
-```powershell
-cd D:\A_university_project\FPGAmmwave\fpga
-.\build/build_vivado.bat
-```
-
-PowerShell 里也可以绕过 .bat 直接调 Vivado
-（反引号 `` ` `` 才是续行符，不是 `^`）：
-
-```powershell
-& "D:\vivado2019\Vivado\2019.1\bin\vivado.bat" -mode batch `
-  -source "D:\A_university_project\FPGAmmwave\fpga\tcl\build_everything.tcl"
-```
-
-在 GUI 里则是在 **Tcl Console** 粘一行：
+**修复（从提示词变成代码）**：
 
 ```tcl
-source D:/A_university_project/FPGAmmwave/fpga/build/tcl/build_everything.tcl
+proc set_any {cell names value} {
+    set props [list_property [get_bd_cells $cell]]     ;# 先枚举真实属性名
+    ...
+    set_property $which $value $obj
+    set got [get_property $which $obj]                 ;# 再回读验证
+    if {$got eq ""} { return 0 }
+}
 ```
 
-这一条会把下面 10 步全部串起来跑完（**约 10–25 分钟**）：
+**同样的坑第二次出现**：`SYNTH_CHECKPOINT_MODE` 连刷 16 条 CRITICAL WARNING。
+这次没有急着找正确名字，而是先问"这个属性是不是根本不需要"——去 `ip/` 目录看生成产物，
+module reference 目录下**没有 `*_ooc.xdc`**，说明它默认就随顶层综合，属性纯属多余，整段删除。
+
+**沉淀**：SK-03 第 7 条 + `set_any` 过程（从提示词变成了代码）+ P4 提示词。
+
+### 3.6 案例 E：34 个悬空输入——"没有报错"比报错更危险
+
+**现象**：Block Design 校验通过（`validate_bd_design OK`），但日志里一条 CRITICAL WARNING 列了 34 个脚：
 
 ```
-建工程 → 加 22 个 RTL + 5 个 ROM 初值 → 建 Block Design → 连全部线
-→ 校验 → HDL Wrapper → 综合 → 实现 → 比特流 → 导出 vs_design.xsa
+[BD 41-759] The input pins ... are either not connected or do not have a source port,
+            and they don't have a tie-off specified. These pins are tied-off to all 0's
 ```
 
-跑完产物：
+**关键判断**：BD 对未连接输入**静默 tie 成 0**。也就是说，设计能过校验、能生成 HDL，
+但 `result_out/heart_bpm_q8` 恒为 0——**PS 读回的心率永远是 0**，而日志里只有一条 WARNING。
 
-| 文件 | 说明 |
-|---|---|
-| `build/vivado/vs_fpga.xpr` | 工程，打开后双击 `vs_bd.bd` 看数据流图 |
-| `build/vivado/vs_fpga.runs/impl_1/vs_bd_wrapper.bit` | 比特流 |
-| `build/vivado/vs_design.xsa` | 硬件平台，给 Vitis 用 |
+**分类处理**（这是本轮最重要的动作）：
 
-**只想到某一步**（省时间）：
+| 类别 | 例子 | 处理 |
+|---|---|---|
+| 真缺口（上游有输出，只是漏连） | `integrate_detrend/win_start`（不接就只测量一次）、`null_model_cancel/clr`（引擎本来就有 `nc_clr` 输出）、`robot_motion_if/win_active` | 补连线 |
+| 缺转换（语义不对） | `peak_argmax/peak_val` 是 32 位幅值，直接接到 16 位 `compet_vr_q15`（`BD 41-1228` 位宽不匹配） | 新增 `ratio_q15` 模块做 peak/sum |
+| 确实还没有数据源 | 共模参考、分量统计量、运动阈值、雷达自定位开关 | **收敛到一个 `vs_defaults` 块** |
 
-```bat
-:: cmd
-build/build_vivado.bat bd      :: 只建工程 + Block Design（约 2 分钟）
-build/build_vivado.bat synth   :: 跑到综合完（约 6-10 分钟）
-build/build_vivado.bat gui     :: 建完 BD 直接打开 GUI
+为什么不干脆让它们悬空：因为悬空会被静默 tie 0，**分不清"设计成 0"和"忘了接线"**。
+收敛到单一模块后，数据流图上一眼能看出哪部分是占位，且占位值集中在一个文件里改。
+
+**沉淀**：SK-01 的核心功能——`check_bd_nets.py` 会主动报告 `??` 悬空输入，
+把"要等 Vivado 校验后从 WARNING 里数"变成"写连线时就报"。
+
+### 3.7 案例 F：资源超量——从"设计太大"到"这一行属性写错"
+
+**现象**：实现阶段布局失败，LUT 需求约 187 k（器件 53.2 k）、分布式 RAM 需求 48 k（器件 17.4 k），
+而 **BRAM 使用量为 0**——一个 1.15 Mbit 的窗口存储器，一块 BRAM 都没用。
+
+**归因链**：
+
 ```
+BRAM = 0  →  大数组没进 BRAM  →  为什么？两个候选：
+                                  (a) 读口是组合读（BRAM 做不到异步读）
+                                  (b) 声明了 ram_style=block 但综合器无法映射
+                              →  看 RTL：ap_val = mem[ap_idx] 是组合读 → 命中 (a)
+                              →  继续查：fir_bandpass.samp_buf 声明了 block，
+                                  但它也在 MAC 循环里被组合读 → 属于 (b) 的变体
+```
+
+**已修（零功能风险）**：`samp_buf`、`peak_argmax.vals`、`spectrum_accum.mem` 三处
+从"被实现成触发器"改为显式 `ram_style="distributed"`；
+**未修（需要重构）**：`integrate_detrend` 的窗口存储器要改成同步读才能进 BRAM。
+
+**沉淀**：SK-03 第 10 条（存储器映射判据）+ 一条通用规则：
+**看到 `BRAM = 0` 就先怀疑读口时序，不要先怀疑容量。**
+
+### 3.8 案例 G：交付形态错了，用户用不了
+
+**现象**：用户执行
 
 ```powershell
-# PowerShell（注意 .\ 前缀）
-.\build/build_vivado.bat bd
-.\build/build_vivado.bat synth
-.\build/build_vivado.bat gui
-
-# 或者不用 .bat，直接设环境变量截断
-$env:VS_STOP_AFTER = "bd"     # 可选 bd | synth | impl | bit
-& "D:\vivado2019\Vivado\2019.1\bin\vivado.bat" -mode batch `
-  -source "D:\A_university_project\FPGAmmwave\fpga\tcl\build_everything.tcl"
+cd /d D:\...\fpga        # 报错：Set-Location 找不到位置形式参数
+build_vivado.bat bd      # 报错：无法将"build_vivado.bat"项识别为 cmdlet
 ```
 
-`build/build_vivado.bat` 里 Vivado 路径不对就改顶部的 `VIVADO_BIN`。
+**根因**：模型默认按 `cmd` 写命令。PowerShell 的 `cd` 不认 `/d`，
+且**出于安全不执行当前目录下的程序**，必须写 `.\build_vivado.bat`。
 
-> 想看详细的 78 步手工点击过程（含每个 IP 从哪个菜单加、60 多根线怎么连），
-> 见 `report/vivado_click_through.md`。
+**修复**：所有操作步骤同时给 cmd 与 PowerShell 两版；`build_vivado.bat` 内部用
+`%~dp0` 推导路径，从任何目录调用都能工作。
 
-### 3.3 在 GUI 里看数据流图
+**教训**：交付物的正确性包含"**在对方的环境里能跑**"。这不是代码问题，
+但用户会把它记成"你给的东西不能用"。
 
-打开 `fpga/build/vivado/vs_fpga.xpr` → 左侧 **Sources** → 双击 `vs_bd.bd`，
-即可看到完整的图形化数据流（**25 个单元**：PS7 + DMA + SmartConnect + GPIO +
-协议转换器 + 常量 + 全部 16 个算法模块）。
+## 4. 技能包的提炼过程
 
-导出成 PDF/SVG 存进论文：
+### 4.1 提炼方法：从"修好"到"拦住"
 
-```bat
-vivado.bat -mode batch -source tcl\export_bd_diagram.tcl
-:: 输出 docs\bd_dataflow.pdf / .svg
+每一次修复后追问三个问题，答得上才写成条目：
+
+1. **现象签名是什么？** —— 下次遇到时，最省力的识别特征（一行报错文本 / 一个报告字段 / 一个反常数值）。
+2. **判据是什么？** —— 修完之后，凭什么说修好了（不是"看起来对"）。
+3. **能不能变成检查？** —— 能写成脚本的写成脚本，写不成的写成清单。
+
+```
+失败/观察 → 现象签名 → 判据 → 形态判定 ┬→ 可脚本化 → 校验脚本（SK-01/02）
+                                        ├→ 可模板化 → 案例模板（SK-04/06/07）
+                                        ├→ 可结构化 → 踩坑清单（SK-03）
+                                        └→ 只能人判断 → 提示词/评审清单（SK-05/08）
 ```
 
-**不想开 Vivado 也能看图**：直接打开 `report/flow_diagram.html`。
+### 4.2 从失败到条目的映射
 
-### 3.4 跑仿真
-
-```bat
-vivado.bat -mode batch -source tcl\run_sim.tcl
-```
-
-四个单元测试：`tb_dacm_phase`（DACM 相位步进）、`tb_hampel7`（尖峰剔除）、
-`tb_fir_bandpass`（带内保留 / 带外抑制）、`tb_goertzel_sweep`（单音频率定位）。
-
-### 3.5 不开 Vivado 的静态检查
-
-```bash
-python sim/scripts/rtl_lint.py       # 关键字配平 + 例化端口名 + ROM 文件存在性
-python sim/scripts/check_bd_nets.py  # BD 连线预检：引脚存在性 / 位宽 / 悬空输入
-```
-
-`check_bd_nets.py` 会解析 `src/rtl/` 下所有模块的端口与位宽（参数代入默认值），
-再逐条核对 `build_bd.tcl` 里的 `vs_net` 连线，输出三类结果：
-
-| 输出前缀 | 含义 | Vivado 里对应的报错 |
+| 来源（哪次失败/观察） | 现象签名 | 沉淀成 |
 |---|---|---|
-| `!!` | 引脚不存在 / 位宽不匹配 | `BD 5-3`、`BD 41-1228` |
-| `??` | RTL 输入脚没被任何连线驱动 | `BD 41-759`（会被静默 tie 成 0） |
-| `--` | 输出脚没人用（仅提示） | 无 |
+| Tcl 中文乱码 | 输出出现 `闃舵??` 之类字符 | SK-08 规则 1（ASCII-only） |
+| `create_bd_cell` 失败且 `$e` 为空 | 单元建到第 N 个就停，无错误文本 | SK-03-2（禁 `include`）+ SK-01 |
+| `buf` 语法错误 | `Syntax error near "buf"` | SK-02（保留字扫描） |
+| `32'sd(NTAP-1)` | `Syntax error near "("` | SK-02（字面量扫描） |
+| Xilinx IP 时钟脚名不同 | `BD 41-758 clock pins are not connected` | SK-03-5 |
+| HP0 是 AXI3、DMA 是 AXI4 | `BD 41-1285 protocols ... incompatible` | SK-03-6 |
+| 协议转换器属性名记错 | `BD 41-1276 Parameter does not exist` | SK-03-7 + `set_any` |
+| 数据宽度三方不一致 | `BD 41-237 DATA_WIDTH does not match` | SK-03-8 |
+| 猜了个不存在的属性 | 16 条 `BD 41-1276` 连刷 | SK-03-7 延伸（先判断"是否需要"） |
+| 34 个悬空输入 | `BD 41-759` 长列表 | SK-01 + SK-03-9 |
+| 幅值接到概率端口 | `BD 41-1228` 位宽不匹配 | SK-01（位宽检查） |
+| 乘法在上文宽度里截断 | 无报错，行为错 | SK-08 规则 3（评审清单） |
+| `BRAM = 0` | 利用率报告字段 | SK-03-10 |
+| PowerShell 语法差异 | 命令直接报"找不到" | SK-08 规则 4（交付按对方 shell） |
+| 综合报告顶层为 0 | 报告里资源全 0 | SK-05 P3 的失效条件 |
 
-理想结果是 `真实问题 0 / 悬空输入 0`。
+### 4.3 如何验证有效
+
+三条不同强度的验证，逐级上升：
+
+**① 复现性验证（强）**
+在**同一个已知坏样本**上跑检查器，看是否能报出问题。例如 `check_bd_nets.py` 的第一版
+就是在"修复前"的 `build_bd.tcl` 上跑的——它报出 34 个 `??` 悬空输入和 2 处位宽不匹配，
+与 Vivado 后来说的完全一致。**检查器先于修复而存在**，这是它能被信任的原因。
+
+**② 回归验证（强）**
+每次改 RTL/连线后重跑，期望恒为 `真实问题 0 / 悬空输入 0`。
+修复过程中新增 `bpm_map` / `ratio_q15` / `vs_defaults` 三个模块、改动了 `vs_engine_fsm`
+与 `result_out` 的端口，检查器从 34 个问题回到 0，说明规则没有被新代码绕过。
+
+**③ 陌生环境验证（中）**
+把条目交给"不知道上下文的人"用：`build/README.md` 与 `report/vivado_click_through.md`
+是按"拿到仓库就能从零建出 BD"写的，其中的每一步都写了"你应该看到什么"。
+判据：若某一步没有可观察的结果，说明这一步对读者是黑箱，需要补充。
+
+**④ 反向验证（边界）**
+故意越界用法，看是否真的会坏——见 §4.4。
+
+### 4.4 边界如何确定
+
+每条技能都必须在 `skill/README.md` 里写明**适用条件**与**失效条件**。边界不是猜的，
+是通过"反向实验 + 证据强度分级"确定的。
+
+**边界一：工具链约束的适用范围**
+
+| 条目 | 适用范围（成立） | 失效条件（会坏） | 怎么确定的 |
+|---|---|---|---|
+| ASCII-only | `.tcl` / `.bat` 等被 Vivado、cmd 解析的文件 | Linux 上的 Vivado 默认 UTF-8，此时非 ASCII 无害但保留也无副作用 | 观察：中文 Windows 下复现乱码；`.md` 里同段中文正常 |
+| 禁用 `` `include `` | 进 Block Design 的 module reference | 纯 RTL 顶层（不经 BD）用 `include` 是正常且推荐的 | 观察：前两个无 include 的模块建单元成功，第三个失败 |
+| `ram_style` 显式声明 | 组合读 / 多地址同拍读 → `distributed`；同步单读 → `block` | 改成同步读后仍写 `distributed`，会白烧 LUTRAM | 反向：把同步读的数组改 distributed 后 LUT 用量上升 |
+| 静态检查器 | `build_bd.tcl` 生成的 BD | 手工在 GUI 改 BD 后，脚本不再是事实来源，检查结果会与实际不符 | 观察：检查器解析的是脚本文本，不是 `.bd` 二进制 |
+
+**边界二：算法取舍的适用范围**
+
+| 决策 | 成立条件 | 失效条件 |
+|---|---|---|
+| 用 FIR 而非 IIR 级联 | 采样率低（20 Hz）、窗长有限（600 点）、系数动态范围受定点限制 | 采样率上百 Hz 且需要陡峭过渡带时，FIR 抽头数会到数千，DSP 与延迟都不可接受 |
+| 用任意频点 DFT 而非 FFT | 只需要少量（< ~256）特定频点，且频点非均匀 | 需要全谱观察、或频点数与 N 同量级时，FFT 的 O(N log N) 更省 |
+
+**边界三：能力边界（最重要的边界）**
+
+三类问题按"能否自动验证"分级：
+
+| 强度 | 能查什么 | 本项目的例子 | 谁来做 |
+|---|---|---|---|
+| 强（脚本可查） | 结构、端口、位宽、连线、ROM 文件 | `rtl_lint.py`、`check_bd_nets.py` | 模型，秒级 |
+| 中（需工具） | 综合、时序、资源、BD 合法性 | 需 Vivado | 人，分钟级 |
+| 弱（只能人判断） | 定点语义、位宽截断、算法正确性 | §3.4 的 4 处截断 | 代码评审 |
+
+**工作流必须显式承认第三类存在。** 本项目的做法是：
+对第三类不假装"有工具保证"，而是把它写成 SK-08 的评审清单，
+并在 `skill/README.md` 里标注"此类条目无法自动验证，须人工过一遍"。
+
+### 4.5 一次失败的边界测试
+
+不是所有尝试都成功。例如曾试图把"位宽截断"也做成脚本检查——
+思路是扫描所有 `<=` 右侧含 `*` 的赋值，若左值位宽小于乘积需要的最小位宽就报警。
+
+结果放弃，原因有二：
+
+1. **误报率高**：大量乘法本来就该截断（饱和处理、定标收敛），逐条报警会淹没真问题；
+2. **判据不唯一**：是否截断正确取决于定点设计意图，脚本无法从语法推断意图。
+
+结论：这类检查**不做成工具，做成评审清单**。这条"放弃"也写进了技能包，
+因为**知道什么不该自动化，和知道什么该自动化同样重要**。
+
+## 5. 协作小结
+
+| 模型做得好 | 模型需要被约束 |
+|---|---|
+| 把一段 600 行的 Python 流水线拆成 17 个接口清晰的模块 | 会凭记忆写 API 与属性名，且错得很自信（案例 D） |
+| 从报错文本反推根因，尤其是"报错信息缺失"本身也是线索（案例 A） | 会把两个独立 bug 归成一个（案例 A） |
+| 把一次性修复沉淀成检查器，形成"错误→规则"闭环 | 查不出语义级错误（案例 C），必须靠人设定评审清单 |
+| 大规模、低创造性但有高一致性的工作（文档、图、表、脚本） | 默认按自己的环境写命令，忽略对方的 shell（案例 G） |
+
+一句话概括本项目的协作经验：
+**让模型做"可被证据裁决"的事，把"不可被证据裁决"的部分显式标出来交给评审。**
+本仓库的两个检查器、`skill/` 下的 8 条技能、以及每条技能附带的失效条件，都是这句话的产物。
 
 ---
 
-## 4. 资源与时间预算（ZYNQ-7020：140 BRAM36 / 220 DSP48 / 106k FF）
+## 附录：协作时间线（按轮次）
 
-| 资源 | 估算占用 | 说明 |
-|---|---|---|
-| BRAM36 | ~46 | 窗口存储器 32 + FIR 缓冲/系数 2×2 + 谱累加 + 结果 |
-| DSP48E1 | ~14 | DACM 4 + FIR 2 + DFT 2 + 中值 0 + LMS 6 |
-| FF | ~15 k | 主要为各 FSM 与流水寄存器 |
-| LUT | ~12 k | 中值网络、地址生成、控制逻辑 |
-
-时间预算（100 MHz，一个 30 s 分析窗）：
-
-| 阶段 | 拍数 | 时间 |
-|---|---:|---:|
-| 采集 + 相位链（实时流式） | — | 与采集同步 |
-| 呼吸路径（~40 通道 × (FIR 307k + DFT 55k)） | 14.5 M | 145 ms |
-| 心脏路径（~40 通道 × (FIR 307k + DFT 121k)） | 17.1 M | 171 ms |
-| 峰值搜索 + 证书 | ~0.1 M | 1 ms |
-| **合计** | **~32 M** | **~320 ms** |
-
-远小于 30 s 的窗口长度，实时余量约 90 倍。
-
----
-
-## 5. 与 Python 的对应关系（摘要）
-
-完整映射、定点格式与**近似点**见 [`report/design_report.md`](design_report.md)。
-
-| Python (scr/) | Verilog | 保真度 |
-|---|---|---|
-| `dataio.load_radar` + 窗口切片 | `radar_frame_if` | 等价 |
-| `dsp.dacm_phase` | `dacm_phase` | 等价（定点 Q4.20） |
-| `dsp.hampel_axis` | `hampel7` | 等价（因果窗，边界差异见文档） |
-| `dsp.integrate_axis`/`detrend_axis` | `integrate_detrend` | 等价（定点最小二乘） |
-| `dsp.bandpass_axis`(butter4+filtfilt) | `fir_bandpass` | **结构替换**：1024 抽头线性相位 FIR |
-| `dsp.spectrum`(FFT) | `goertzel_sweep` | 结构替换：频点精确 DFT |
-| `_harmonic_residual`(lstsq) | `null_model_cancel` | **近似**：LMS 自适应抵消 |
-| `_common_mode_reference`(SVD) | `cm_ref_extract` | **近似**：均值 + 正交副相 |
-| `_vr_sweep`(QR) | `null_model_cancel` + `goertzel_sweep` | 近似（抵消后取周期图） |
-| `_fused_spectrum` | `spectrum_accum` | 近似：等权非相干累加 |
-| `parabolic_peak` / `argmax` | `peak_argmax` | 等价 |
-| `_certificate` | `certificate_fsm` | 等价（门限完全一致） |
-
----
-
-## 6. 必须知道的三件事
-
-1. **真值是血氧仪候选值，不是 ECG 金标准。** Python 侧所有 MAE/RMSE 都是与消费级
-   血氧仪的**一致性**；本移植不改变这一点，FPGA 只是把同一条管线做进 PL。
-
-2. **共模参考与谐波回归是定点近似。** Python 用 `np.linalg.svd`（80×80 矩阵）
-   与 `np.linalg.lstsq`，硬件用"空仓带通均值 + 1/4 周期延迟正交"与 LMS 抵消。
-   这是本移植最主要的算法近似，稳定性验证需要重新采集数据跑一遍。
-
-3. **`support`（分量一致度）目前是占位常量 0.8。**
-   Python 里它由逐 (bin,RX) 的 argmax 一致性统计得到，需要额外的分量级结果暂存与
-   统计逻辑；当前版本先用常量，`certificate_fsm` 会相应输出 MEASURE 级。
-   若要完整复现，需要扩展 `spectrum_accum` 为"逐分量独立累加 + 中位数统计"。
-
----
-
-## 7. 报错对照表（都是实测踩过的）
-
-| Vivado 报错 | 真正原因 | 已做的修复 |
-|---|---|---|
-| 输出全是 `闃舵??` 乱码 | Vivado 的 Tcl 用系统代码页(GBK)读 `.tcl`，UTF-8 中文被解错 | 全部 `.tcl` / `.bat` 改为纯 ASCII |
-| BD 建到 `hampel7_0` 就失败，`reason` 是空的 | **BD 的 HDL 解析器不走 `include_dirs`**，`create_bd_cell -type module -reference` 解不开 `` `include "vs_params.vh" `` | 删掉 `vs_params.vh`，全部宏内联成字面量，全工程 0 个 `` `include `` |
-| `Syntax error near "buf"` (fir_bandpass.v) | `buf` 是 Verilog 内建门级原语关键字，不能当标识符 | 改名 `samp_buf` |
-| `Syntax error near "("` (fir_bandpass.v) | `32'sd(NTAP-1)` —— sized literal 后面不能跟括号表达式 | 引入 `localparam integer NTAP_M1 = NTAP - 1;` |
-| `BD 41-758 ... clock pins are not connected` | Xilinx IP 的时钟引脚**不叫** `aclk`：DMA 是 `s_axi_lite_aclk`/`m_axi_mm2s_aclk`，GPIO 是 `s_axi_aclk`，PS7 自己还要接 `M_AXI_GP0_ACLK`/`S_AXI_HP0_ACLK` | 逐个显式连接 |
-| `BD 41-1285 ... (AXI3) and ... (AXI4) are incompatible` | Zynq-7000 的 `S_AXI_HP0` 固定是 AXI3，DMA `M_AXI_MM2S` 是 AXI4 | 插入 `axi_protocol_converter`（`axi_pc`，SI=AXI4 / MI=AXI3） |
-| `CRITICAL WARNING: [BD 41-1276] Cannot set the parameter C_M_AXI_PROTOCOL / C_S_AXI_PROTOCOL. Parameter does not exist` | 该 IP 的属性名是 `CONFIG.SI_PROTOCOL` / `CONFIG.MI_PROTOCOL`。**写错名字只是 CRITICAL WARNING，不会中断脚本，属性静默丢失** | Tcl 改用 `set_any` 过程：枚举真实属性名再设，并打印用的是哪一个 |
-| `BD 41-237 Data width does not match ... HP0(64) / M_AXI(32)` | DMA MM2S 是 32 位，而 PS7 的 HP0 默认 **64 位**；协议转换器两侧共用一个数据宽度 | `CONFIG.PCW_S_AXI_HP0_DATA_WIDTH = 32` + `CONFIG.DATA_WIDTH = 32` |
-| `NO PORT MATCH fir_resp_0/m_data -> goertzel_resp_0/s_data` | 这三对模块用的是普通 `data/valid/ready` 信号，不是 AXI-Stream（`tdata/tvalid`），连接助手认不出 | 改成三根线各自显式连接 |
-| 16 条 `CRITICAL WARNING: [BD 41-1276] Cannot set the parameter SYNTH_CHECKPOINT_MODE. Parameter does not exist` | 我猜的属性名不对（module reference 根本没有这个属性）。**好消息是并不需要**：模块引用默认就是随顶层一起综合的，`vs_bd_fir_resp_0_0/` 目录里没有 `*_ooc.xdc`，说明它没有走 OOC，`$readmemh` 的搜索路径本来就是项目正常路径 | 整个 2b) 段已删除 |
-| `CRITICAL WARNING: [BD 41-759]` 列出 34 个未连接输入脚 | BD 对未连接输入**静默 tie 成 0**，分不清"设计成 0"和"忘了接线"。其中 `integrate_detrend/win_start`（不接就只测量一次）、`result_out/heart_bpm_q8`（PS 读回全 0）、`null_model_cancel/clr`（引擎本来就有 `nc_clr` 输出却没接）是真缺口 | 逐个接上真实来源；确实还没有数据源的 30 个输入统一收敛到 `vs_defaults` 块；新增 `bpm_map`（索引->bpm）和 `ratio_q15`（peak/sum）两个模块 |
-
----
-
-## 8. 日志里的"无害警告"（不用管它们）
-
-BD 阶段跑完日志里还会剩几类 WARNING，都是**已知无害**的，不影响综合与实现：
-
-| 警告 | 次数 | 为什么可以忽略 |
-|---|---|---|
-| `[BD 41-235] Width mismatch ... 's_sc_payld'(146) to net 'S_SC_AR_1_PAYLD'(142)` | ~32 条 | SmartConnect IP **内部**节点的载荷位宽提示，Xilinx IP 自带的，改不了也不影响功能 |
-| `[BD 41-1306] The connection to interface pin /axi_gpio_ctrl/gpio_io_o is being overridden by the user` | 2 条 | 我们**故意**手动连 `gpio_io_o` 而不用它的接口捆绑，就是想要这个行为 |
-| `[IP_Flow 19-587] HDL port or parameter 'xxx' has a dependency on the module local parameter 'yyy'` | 十几条 | BD 的 HDL 解析器看不懂 `localparam`/`derive` 表达式，只是**提示**它按默认值推断；真正的综合不看这个 |
-| `[IP_Flow 19-3153] Bus Interface 'aclk': ASSOCIATED_BUSIF bus parameter is missing` | 十几条 | 纯组合模块（如 `bin_selector`）没有 AXIS 接口可关联，正常 |
-| `[IP_Flow 19-1976] HDL Parser: Replacing 'AW_S' by 10` | 几条 | 解析器把局部参数按值展开，正常 |
-
-> `BD 41-927`（`CLK_DOMAIN ... may not be synchronized`）曾经一次刷 19 条，
-> 现在已经通过给每个 module-reference 的 `aclk` 脚显式打 `CONFIG.FREQ_HZ = 100 MHz` 消掉，
-> 下次跑会多出一行 `clock pins tagged with FREQ_HZ : 19 / 19`。
-
----
-
-## 9. 下一步：跑完综合 → 实现 → 比特流
-
-Block Design 已经确认 OK，剩下的一次跑完：
-
-```bat
-cd /d D:\A_university_project\FPGAmmwave\fpga
-build/build_vivado.bat
-```
-
-约 10–25 分钟（主要花在综合和实现）。也可以分两步，先用 `synth` 模式确认综合能过：
-
-```bat
-build/build_vivado.bat synth
-```
-
-完成后会打印：
-
-```
-  bitstream    : .../build/vivado/vs_fpga.runs/impl_1/vs_bd_wrapper.bit  (xxxxxxx bytes)
-  hw platform  : .../build/vivado/vs_design.xsa  (xx.x MB)
-```
-
-**两个要看的判据**
-
-| 判据 | 位置 | 期望 |
-|---|---|---|
-| 综合资源 | `build/vivado/vs_fpga.runs/synth_1/vs_bd_wrapper_utilization_synth.rpt` | BRAM36 ≈ 40–50 / 140，DSP48 ≈ 15 / 220，LUT/FF 都远有余量 |
-| 实现时序 | `build/vivado/vs_fpga.runs/impl_1/vs_bd_wrapper_timing_summary_routed.rpt` | **WNS ≥ 0**。若为负，把 `build/tcl/build_bd.tcl` 里 PS7 的 `PCW_FPGA0_PERIPHERAL_FREQMHZ` 从 100 改成 50 重跑——本设计吞吐需求极低（每 30 s 窗口只跑约 32 M 拍），50 MHz 完全够 |
-
-**`$readmemh` 的风险已经排除。** 之前担心 module reference 走 OOC 综合会找不到
-`fir_coeff.mem` / `dft_delta.mem` / `sin_lut.mem`；实际检查 BD 生成的 `.xci`，
-初值文件**已经被登记进每个 module reference 的源文件表**：
-
-```
-vs_bd_fir_resp_0_0.xci        -> fir_coeff.mem
-vs_bd_fir_card_0_0.xci        -> fir_coeff.mem
-vs_bd_goertzel_resp_0_0.xci   -> dft_delta.mem  sin_lut.mem
-vs_bd_goertzel_vr_0_0.xci     -> dft_delta.mem  sin_lut.mem
-```
-
-这正说明把 `.mem` 加进工程并设成 **Memory Initialization Files** 是有效的
-（`build_all.tcl` 第 3 步做的事），综合时能按文件名找到。
-
-**两条通用经验**（写进 `sim/scripts/rtl_lint.py` 的检查项了）：
-
-1. **不要给 RTL 文件加任何 `` `include ``。** BD 的 module-reference 解析器不理
-   `include_dirs`，只要一个模块依赖 include，它就建不进 BD。
-2. **`set_property` 写错属性名不会报错。** 只想设 IP 参数时，一定用
-   `set_any`（枚举 + 打印实际生效的属性名），或者事后用
-   `get_property` 回读确认，否则会像上面那条一样静默失效。
+| 轮次 | 人提供 | 模型产出 | 结果 |
+|---:|---|---|---|
+| 1 | 原始 Python 代码 + 需求 | 算法阶段拆解、定点规格、模块划分 | 通过 |
+| 2 | 板卡型号 ZYNQ-7020 | 22 个 RTL 模块 + 一键构建脚本 | 通过 |
+| 3 | 「探测时间太长，先搭框架」 | 工作流改造：放弃探测，交付脚本 + 静态检查 | 工作流变更 |
+| 4 | 日志 #1（乱码 + 建单元失败） | 定位编码与 `include` 两个独立问题 | 修复 |
+| 5 | 日志 #2 | `buf` 保留字 + 非法字面量 + 4 处位宽截断 | 修复 |
+| 6 | 日志 #3 | IP 时钟脚名、AXI3/AXI4、普通流连线 | 修复 |
+| 7 | 日志 #4 | 属性名（SI/MI_PROTOCOL）+ 数据宽度 32 | 修复 |
+| 8 | 日志 #5 | 删除多余属性 + 34 个悬空输入分类处理 | BD 校验通过 |
+| 9 | 综合报告 | 资源归因：存储器映射 | 部分修复 |
+| 10 | 文档需求（截图 + Word） | 自动出图出表的脚本 + Word 报告 | 交付 |
+| 11 | 目录规范要求 | 仓库重组（全英文路径）+ README 重写 | 交付 |

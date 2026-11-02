@@ -127,7 +127,7 @@ mmwave-vital-signs-fpga/
 │   └── vivado/                  Vivado 工程目录（本地生成）
 ├── board/README.md              上板流程、串口输出、实测记录
 ├── data/rom_tables/             FIR 系数 / DFT 网格 / 正弦表的 CSV 参考值
-├── skill/README.md              工程技能包：改哪里、怎么验证、别踩什么
+├── skill/README.md              工程技能包：8 条技能（校验脚本 / 踩坑清单 / 模板 / 提示词）
 └── report/                      设计报告、BD 说明、模块图、协作记录
 ```
 
@@ -246,10 +246,10 @@ source <repo>/sim/tcl/run_sim.tcl     # tb_dacm_phase / tb_hampel7 / tb_fir_band
 | [`report/bd_structure.md`](report/bd_structure.md) | Block Design 28 个单元逐个说明、核心算法定位、资源优化路线 |
 | [`report/bd_modules_and_nets.docx`](report/bd_modules_and_nets.docx) | 19 张模块图 + 129 条连接关系总表（Word） |
 | [`report/flow_diagram.html`](report/flow_diagram.html) | 数据流图（浏览器直接打开） |
-| [`report/llm_collaboration.md`](report/llm_collaboration.md) | 大模型协作记录：需求拆解、每次报错的根因与修复判据 |
+| [`report/llm_collaboration.md`](report/llm_collaboration.md) | 大模型协作记录（提示词 / 自我纠错轨迹 / 智能体工作流）+ 技能包提炼过程 |
 | [`report/vivado_guide.md`](report/vivado_guide.md) | Vivado 流程总览 |
 | [`report/vivado_click_through.md`](report/vivado_click_through.md) | 逐条打勾的手动点击清单（78 步） |
-| [`skill/README.md`](skill/README.md) | 工程技能包：参数在哪、改 RTL/BD 的流程、排障速查 |
+| [`skill/README.md`](skill/README.md) | 工程技能包：8 条技能，每条含适用范围 / 使用方法 / 已验证效果 / 失效条件 |
 | [`build/README.md`](build/README.md) | 构建脚本分工与产物位置 |
 | [`src/README.md`](src/README.md) | RTL 清单、ROM 表、定点格式速查 |
 

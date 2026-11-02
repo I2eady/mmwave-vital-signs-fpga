@@ -1,106 +1,346 @@
 # skill — 工程技能包
 
-本文件把"如何安全地修改并复现这个工程"固化成一份可复用的操作手册，供人或 AI 助手按图施工。
-它不介绍算法原理（那在 `report/design_report.md`），只回答**改哪里、怎么验证、别踩什么**。
+把与大模型协作过程中沉淀下来的经验显式化，供**另一个团队直接复用到自己的题目上**。
+每一项都写明：适用范围 / 使用方法 / 已验证的效果 / 来源（从哪次失败或观察总结）/ 失效条件。
 
-## 1. 适用场景
+技能包不介绍本项目的算法（那在 `report/design_report.md`），只回答三件事：
+**改哪里、怎么验证、什么情况下会失效。**
 
-| 触发 | 该看哪一节 |
+## 0. 目录与通用性标注
+
+| 编号 | 名称 | 形态 | 是否绑定本题目 |
+|---|---|---|---|
+| SK-01 | Block Design 连线预检器 | 校验脚本 | 否（任何 Vivado BD 项目可用） |
+| SK-02 | RTL 结构预检器 | 校验脚本 | 否（任何 Verilog 项目可用） |
+| SK-03 | Vivado / BD 踩坑清单（12 条） | 踩坑清单 | 否（条目通用，例子来自本项目） |
+| SK-04 | 分层构建脚本骨架 | 案例模板 | 否（任何 Vivado 工程可用） |
+| SK-05 | 6 条提示词模板 | 提示词工作流 | 否 |
+| SK-06 | 定点系数体检 | 校验脚本 | 部分（针对定点滤波设计） |
+| SK-07 | BD 文档自动生成 | 案例模板 | 否（任何 BD 项目可用） |
+| SK-08 | 工具链约束与评审清单（4 条） | 踩坑清单 | 否 |
+
+"绑定本题目"列的意思是：换一块板、换一个算法，这条还能不能用。
+标"否"的可以直接搬到别的嵌入式 / FPGA 赛题上。
+
+## 1. SK-01 Block Design 连线预检器
+
+**文件**：`sim/scripts/check_bd_nets.py`（约 250 行，纯标准库）
+
+**适用场景**
+用 Tcl 脚本生成的 Vivado Block Design，改完 RTL 端口或连线后，想在不打开 Vivado 的前提下
+知道连线有没有问题。
+
+**使用方法**
+
+```bash
+python sim/scripts/check_bd_nets.py
+```
+
+它做三件事：解析 `src/rtl/**/*.v` 的端口名与位宽（参数代入默认值）→ 解析
+`build/tcl/build_bd.tcl` 里全部 `mkmod` / `vs_net` / `vs_link` → 交叉核对。
+
+输出三类前缀：
+
+| 前缀 | 含义 | 对应的 Vivado 报错 |
+|---|---|---|
+| `!!` | 引脚不存在 / 位宽不匹配 | `BD 5-3`、`BD 41-1228` |
+| `??` | RTL 输入脚没被任何连线驱动 | `BD 41-759`（会被静默 tie 成 0） |
+| `--` | 输出脚没人用（仅提示，通常无害） | — |
+
+**已验证的效果**
+在**修复前**的工程上首次运行，报出 **34 个 `??` 悬空输入**与 **2 处 `!!` 位宽不匹配**，
+与随后 Vivado 校验给出的 `BD 41-759`、`BD 41-1228` 完全一致；
+修复后回到 `真实问题 0 / 悬空输入 0`，且期间新增 3 个模块、改动 2 个模块的端口。
+
+**来源**
+第二轮实跑时，Vivado 用一条 CRITICAL WARNING 列了 34 个被 tie 成 0 的输入脚。
+当时只能人眼从日志里数，且**改一处就要重新跑 1 分钟 BD 才知对错**。
+于是把"Vivado 会替我做的那部分校验"搬到本地实现。
+
+**失效条件**
+1. **BD 不是本脚本生成的**：检查器读的是 `build_bd.tcl` 文本，不是 `.bd` 文件。
+   一旦有人在 GUI 里手改 BD 且不回写脚本，检查结果与实际拓扑不符——
+   这时脚本反而会造成"检查通过但实际不对"的错觉。**必须先回写脚本。**
+2. **位宽函数算不出的表达式**：端口位宽若写成 `$clog2(N)+1` 之类，脚本只能按参数默认值近似。
+   用法上要求：**端口位宽只用参数或字面量**，这是给检查器留的可解析性。
+3. **Xilinx IP 的内部端口**：脚本不知道 IP 的端口表，涉及 IP 的连线只做存在性跳过。
+
+## 2. SK-02 RTL 结构预检器
+
+**文件**：`sim/scripts/rtl_lint.py`
+
+**适用场景**
+手写或模型生成的 Verilog，在进 Vivado 之前做一轮秒级体检。
+尤其适合"模型一次生成几十个文件"的场合——错误分布广，逐个开仿真不现实。
+
+**使用方法**
+
+```bash
+python sim/scripts/rtl_lint.py
+```
+
+检查项与判据：
+
+| 检查项 | 为什么值得单独检查 |
 |---|---|
-| 改动算法参数（频带、网格、门限） | §3 参数在哪 |
-| 新增 / 替换一个算法模块 | §4 改 RTL 的流程 |
-| 改 Block Design 的连线或单元 | §5 改 BD 的流程 |
-| 换器件 / 换板卡 | §6 移植清单 |
-| 报告数字不对、资源爆掉 | §7 排障 |
+| `module/endmodule`、`begin/end`、`case/endcase` 配平 | 语法错误，Vivado 报错位置常偏移几十行 |
+| 例化端口名是否存在于被例化模块 | 端口名拼错时 Verilog 只是"悬空"，**不报错**但功能丢 |
+| 标识符是否用了 Verilog 保留字 | `buf`/`not`/`tran`/`nmos` 等内建原语名会直接语法错误 |
+| sized literal 后是否紧跟括号 | `32'sd(NTAP-1)` 非法，必须先算成 `localparam` |
+| `function` 是否声明在调用点之前 | Verilog 要求先声明后用，报错信息指向调用行，容易误判 |
+| `$readmemh` 的 ROM 文件是否存在 | 综合期才报 `cannot open file`，发现得太晚 |
 
-## 2. 仓库约定（硬性）
+**已验证的效果**
+在本项目的 25 个 `.v` 上捕获 3 类真实错误：保留字 `buf`、非法字面量 `32'sd(NTAP-1)`、
+函数 `sat24` 声明晚于调用。三者都曾让 Vivado 报出难以定位的
+`Syntax error near "buf"` / `near "("`。
 
-1. **目录与文件名只用小写英文、数字、下划线、连字符**；中文只出现在文件正文。
-2. **`.tcl` 与 `.bat` 必须是纯 ASCII。** Vivado 的 Tcl 在中文 Windows 上按系统代码页读文件，
-   非 ASCII 会变乱码（表现为 `闃舵??`），且 `catch` 后的报错信息也会被吞掉。
-3. **RTL 里禁止 `` `include ``。** Block Design 的 `create_bd_cell -type module -reference`
-   用的是另一个 HDL 解析器，不认 `include_dirs`，带 include 的模块建单元必失败。
-   全局参数一律内联成字面量。
-4. **中文注释可以，但不要写进需要被 Vivado 解析的字符串**（如 `$display` 格式串）。
-5. **`$readmemh` 的文件必须加进工程并设成 `Memory Initialization Files`**，
-   由 `build/tcl/build_all.tcl` 自动完成，新增 `.mem` 时记得同步那张表。
+**来源**
+第一次 HDL 解析失败时，Vivado 只说 `Syntax error near "buf"`，
+既不说是关键字、也不说该怎么改。把这类"报错信息质量差"的错误全部转成自己的检查项。
 
-## 3. 参数在哪
+**失效条件**
+1. 只做**结构与命名**检查，不查语义。位宽截断（见 SK-08 规则 3）它查不出来。
+2. 端口解析基于正则，**过度花哨的端口声明**（宏展开、`interface`、SystemVerilog 结构体）会漏解析。
+   用法约定：端口用 ANSI 风格、位宽用参数或字面量。
+3. 配平检查会跳过注释与字符串，但**不会跳过 `ifdef` 分支**——若两个分支各写一半括号，会误报。
 
-| 参数 | 位置 | 备注 |
+## 3. SK-03 Vivado / BD 踩坑清单（12 条）
+
+每条格式：**现象签名 → 真因 → 修法**。这是整个技能包里复用价值最高的一项。
+
+| # | 现象签名（最省力的识别特征） | 真因 | 修法 |
+|---:|---|---|---|
+| 1 | 脚本输出出现 `闃舵??` 之类乱码 | Vivado 的 Tcl 在中文 Windows 上按系统代码页（GBK）读文件，UTF-8 中文被解错 | `.tcl` / `.bat` 全部改 **纯 ASCII**；中文只留在 `.md` / 注释外的文档里 |
+| 2 | `create_bd_cell -type module -reference` 失败，`catch` 到的 `$e` 为**空串** | 模块里有 `` `include ``。BD 的 HDL 解析器**不认 `include_dirs`** | 删除 include 文件，全局参数内联成字面量 |
+| 3 | `Syntax error near "buf"` | `buf` 是 Verilog **内建门级原语名**，不能作标识符 | 改名（`buf` → `samp_buf`） |
+| 4 | `Syntax error near "("` | `32'sd(NTAP-1)`：sized literal 后不能跟括号表达式 | 先 `localparam integer NTAP_M1 = NTAP - 1;` |
+| 5 | `BD 41-758 clock pins are not connected` | Xilinx IP 的时钟/复位脚**不叫** `aclk`/`aresetn` | 逐个显式连：`s_axi_lite_aclk`、`m_axi_mm2s_aclk`、`s_axi_aclk`、`M_AXI_GP0_ACLK`、`S_AXI_HP0_ACLK` |
+| 6 | `BD 41-1285 protocols (AXI3) and (AXI4) are incompatible` | Zynq-7000 的 `S_AXI_HP0` 从机口固定 AXI3，AXI-DMA 主机口是 AXI4 | 中间插 `axi_protocol_converter`（S=AXI4, M=AXI3） |
+| 7 | `BD 41-1276 Cannot set the parameter X. Parameter does not exist`（**只剩一条 CRITICAL WARNING，脚本不中断**） | 属性名记错了。`axi_protocol_converter` 是 `CONFIG.SI_PROTOCOL`/`CONFIG.MI_PROTOCOL`，不是 `C_S_AXI_PROTOCOL` | `list_property` 枚举真实名再 set，**设置后 `get_property` 回读**；同时先问"这个属性是否根本不需要" |
+| 8 | `BD 41-237 DATA_WIDTH does not match between HP0(64) and ...(32)` | 协议转换器主从**共用一个数据宽度**，不做宽度变换；PS7 的 HP0 默认 64 位 | 三方一致：`PCW_S_AXI_HP0_DATA_WIDTH=32`、`axi_pc.CONFIG.DATA_WIDTH=32`、DMA `c_m_axi_mm2s_data_width=32` |
+| 9 | `BD 41-759 The input pins ... are tied-off to all 0's`（长列表） | BD 对未连接输入**静默 tie 0**，设计照样过校验、照样生成 HDL | 分类处理：漏连的补线、语义不对的加转换模块、确实没源的收敛到一个 defaults 模块 |
+| 10 | 利用率报告里 `Block RAM Tile = 0`，`LUT as Memory` 接近上限 | 大数组被实现成分布式 RAM/触发器：**组合读**（同一拍读多地址）BRAM 做不到；或声明了 `ram_style="block"` 但实际是异步读 | 组合读 → `ram_style="distributed"`；要进 BRAM 必须改**同步读** |
+| 11 | `make_wrapper` 报文件已存在 | `generate_target` 已经把 wrapper 写到 `bd/<bd>/hdl/` 下了 | 先查项目源，再查磁盘文件，存在就只 `add_files`，不存在才 `make_wrapper` |
+| 12 | `$readmemh: cannot open file xxx.mem` | `.mem` 没进工程，或进了但没有设成 `Memory Initialization Files` 类型 | `add_files` 后 `set_property file_type {Memory Initialization Files}`；多目录时设 `include_dirs` |
+
+**如何使用**
+不必按顺序读。**先按"现象签名"定位到行号，再执行修法，最后用"判据"确认**：
+
+| # | 修完的判据 |
+|---:|---|
+| 1 | 脚本输出全英文、无乱码 |
+| 2 | 该单元打印 `OK`，且后续所有单元都能建 |
+| 3–4 | HDL 解析无 `Syntax error` |
+| 5 | `validate_bd_design` 不再报 `BD 41-758` |
+| 6–8 | `validate_bd_design` 不再报 `BD 41-1285` / `BD 41-1276` / `BD 41-237` |
+| 9 | `BD 41-759` 消失，且检查器 `??` 计数为 0 |
+| 10 | `Block RAM Tile > 0`，`LUT as Memory` 显著下降 |
+| 11 | wrapper 成为工程源文件，综合能启动 |
+| 12 | 综合日志无 `cannot open file` |
+
+**来源**
+12 条全部来自本项目的实际报错，逐条记录在 `report/llm_collaboration.md` §3。
+其中第 7 条最值得强调：**写错属性名不会报错，只会静默丢失**，
+所以它的修法里包含"回读验证"这一步，而不只是"改对名字"。
+
+**失效条件**
+1. 只对 **Vivado 2019.1 + Zynq-7000** 验证过。Versal / UltraScale+ 的 PS 端口名与
+   协议能力不同（例如部分 HP 口支持 AXI4），第 6、8 条的结论可能不成立。
+2. 第 2 条只适用于"模块进 Block Design"的场景；纯 RTL 工程用 `` `include `` 是正常做法。
+3. 第 10 条依赖综合器的推断行为；换综合工具（如 Vivado Synthesis 以外的流程）需重新验证。
+
+## 4. SK-04 分层构建脚本骨架
+
+**文件**：`build/tcl/`（6 个脚本）
+
+**适用场景**
+任何"用 Tcl 从零生成 Vivado 工程"的项目。避免写成一个大脚本——那样一处失败就无法复用中间结果。
+
+**使用方法**
+按职责分层，每层可单独重跑：
+
+```
+build_everything.tcl   总入口：串两个 stage，打印耗时与产物路径
+  ├── build_all.tcl      建工程 + 加源码 + 设搜索路径 + 调下一层
+  │     └── build_bd.tcl 只建 BD：单元 → 时钟复位 → AXI → 数据流 → 地址 → 校验 → 生成
+  └── build_after_bd.tcl wrapper → 综合 → 实现 → 比特流 → xsa → 归档报告
+wire_only.tcl          只连线（给手工拖模块的用法，先检查单元齐不齐）
+export_bd_diagram.tcl  只导出框图
+```
+
+三个可复用的设计点：
+
+1. **根目录自解析**：`set root [file normalize [file join [file dirname [file dirname [file dirname [info script]]]]]]`
+   ——脚本放在二级目录时 `file dirname` 要走三层，这样从任何 cwd 调用都对。
+2. **建单元带打印**：`mkmod` 每次先 `puts "  OK  <cell>"`，失败时打印模块名 + 原因 + 排查提示。
+   因为 `catch` 会把错误吞成空串，**不打日志就永远不知道是哪个单元挂的**。
+3. **可截断**：环境变量 `VS_STOP_AFTER=bd|synth|impl|bit` 控制停在哪，
+   改一行就能只跑 1 分钟的 BD 而不必等 20 分钟的全流程。
+
+**已验证的效果**
+同一个脚本在 6 轮实跑中每次都是从零重建（先删旧 BD），
+每轮都能精确定位到"第几个单元"或"哪一类连线"出错。
+
+**来源**
+最初是单文件脚本，第 3 个单元失败时无法判断是"这一步的问题"还是"前面状态残留的问题"。
+
+**失效条件**
+1. 只适用于 **batch/GUI 两种模式都跑**的写法；依赖 GUI 交互的步骤（如 IP 的 Re-customize）
+   必须全部转成 `set_property`，否则脚本不可重跑。
+2. `VS_STOP_AFTER` 依赖环境变量；在纯 GUI 里需手改脚本顶部常量。
+
+## 5. SK-05 提示词模板（6 条）
+
+**适用场景**
+用大模型做硬件工程时，"怎么问"比"用什么模型"影响更大。以下 6 条经本项目验证。
+
+| 编号 | 模板（可直接改用） | 使用场景 | 已验证效果 | 失效条件 |
+|---|---|---|---|---|
+| P1 | 「不要先探测。先把整体框架搭起来：每部分代码生成、例化模块、再连线。给出目录结构、模块清单、每一步的判据。如果探测几分钟出不来就放弃探测。」 | 工具链行为未知、单轮实跑代价高 | 从"卡在探测"转为 40 分钟产出 22 个模块 + 可执行构建脚本 | 工具行为会**改变架构**时不能跳（如工具根本不支持该方案，必须先探测） |
+| P2 | 「这是完整构建日志。定位**第一个** ERROR 的根因，引用支撑它的日志行原文，给最小修复。不要一次改多处。」 | 贴日志求助 | 6 轮日志中每轮都把可疑点从 20+ 收敛到 1 | 多个错误有共同上游（如编码问题引起连锁）时，"第一个 ERROR"可能是假象 |
+| P3 | 「读 synth 报告与各模块 OOC 报告，按层次列出 LUT/FF/BRAM/DSP 占比，指出前三名，并说明它们为什么被实现成这个形态。」 | 资源超标、时序不收敛 | 定位到"窗口存储器成为 48 000 个 LUTRAM"，而非泛泛的"设计太大" | **顶层报告全 0 时**必须去读各模块自己的报告，否则会得出"没用资源"的错误结论 |
+| P4 | 「凡 `set_property`，先 `list_property` 枚举真实属性名再设置，设置后 `get_property` 回读；不要用你记得的属性名。」 | 调用任何工具的配置接口 | 把"静默失败"变成"显式失败" | 属性存在但语义不同时，枚举查不到语义，仍需现象反推 |
+| P5 | 「根据真实端口声明和真实连线生成图与表，不要手画、不要凭印象补充。生成脚本要能重跑。」 | 出图、出表、写文档 | 19 张模块图 + 129 条连线表可重生成，改完 RTL 重跑即同步 | BD 若手工在 GUI 改过，脚本解析的拓扑不是真实拓扑 |
+| P6 | 「我在 PowerShell 里」+ 报错原文 | 交付操作步骤 | 暴露"模型默认按 cmd 写命令"的偏差，之后所有步骤给两版 | 无（纯表述问题），但必须由用户报错触发 |
+
+**来源**
+P1 来自用户原话「你这个探测脚本运行时间过长了…如果探测半天不出结果就别探测了」；
+P6 来自用户把两条 PowerShell 报错原文贴回来。**两条都是被用户纠正出来的，不是模型自发的。**
+
+**失效条件（整体）**
+这些模板解决的是"工程流程"问题，不解决"算法正确性"问题。
+用它生成的东西仍然需要 SK-01/02 这类脚本和人工评审来兜底。
+
+## 6. SK-06 定点系数体检
+
+**文件**：`build/scripts/gen_rom.py` 中的校验段
+
+**适用场景**
+把浮点滤波器（butter / firwin）定点化之前，先检查系数是否**放得进目标精度**。
+
+**使用方法**
+生成系数后立刻算三项指标并打印：
+
+```
+通带增益范围     目标：0.997 ~ 1.003     （平坦度）
+阻带最大幅值     目标：< 1e-3（-60 dB 量级）
+max|系数|        目标：< 0.5            （给 Q 格式留余量）
+```
+
+**核心判据（一条不等式）**：
+
+```
+max|系数|  >  2^(-FRAC_BITS) × 2     否则系数会被量化成 0
+```
+
+**已验证的效果**
+本项目第一次用 `butter(4)` + scipy 的 SOS 分解，打印出 `b0 ≈ 2e-5`，
+而 Q4.14 的量化步长是 `6.1e-5` —— **b0 直接被量化成 0**，滤波器等于不存在。
+换 1024 抽头对称 FIR 后：`max|系数| = 0.123`、通带 `0.997~1.003`、阻带 `-54 dB`。
+
+**来源**
+这是本项目最有价值的"观察型"经验：**滤波器设计软件不关心你的定点格式**，
+它给出的系数在浮点下完美，在定点下可能是 0。
+
+**失效条件**
+1. 只对"系数量化"这一环有效，不检查**级间中间量**的溢出（级联结构还需要动态范围分析）。
+2. 判据 `max|系数| > 2^-FRAC` 是必要条件，不是充分条件：满足它仍可能在级间下溢，
+   所以本项目最终选择了**单级 FIR**（无级间）而非级联 IIR。
+
+## 7. SK-07 BD 文档自动生成
+
+**文件**：`report/scripts/gen_bd_doc_assets.py`、`gen_bd_doc_html.py`
+
+**适用场景**
+任何用脚本建的 Block Design，需要出"每个模块一张图 + 连接关系总表"的交付材料。
+
+**使用方法**
+
+```bash
+python report/scripts/gen_bd_doc_assets.py   # 19 张模块图 + 总览 + nets.md
+python report/scripts/gen_bd_doc_html.py     # 组装成可插入 Word 的 HTML
+```
+
+做法：把 RTL 端口（名字/方向/位宽）与脚本里的连线交叉，给每个模块算出
+"谁驱动我 / 我驱动谁"，再用 matplotlib 画成模块图（左侧输入、右侧输出、中间标注算法）。
+
+**已验证的效果**
+19 张模块图 + 129 条连线表全部由脚本生成；改完 RTL 或连线后重跑即同步，
+不存在"文档和图不一致"。
+
+**来源**
+手工画 19 张图的成本极高，且**改一次端口就要全部重画**。
+更重要的是：手画时模型会"凭印象补齐"不存在的连线，这是最危险的幻觉形式。
+
+**失效条件**
+1. 同 SK-01：BD 必须是脚本生成的事实。
+2. 图的布局是固定分区（按数据流分层），模块数量差一个量级时需要调版式。
+
+## 8. SK-08 工具链约束与评审清单（4 条）
+
+前三条是**约束**（写代码时必须遵守），第四条是**评审清单**（工具查不出，必须人过）。
+
+### 规则 1：被工具解析的文件必须纯 ASCII
+
+* **范围**：`.tcl`、`.bat`，以及任何被 Vivado / cmd 读取的文件。
+* **为什么**：中文 Windows 下这些工具按系统代码页解码，UTF-8 中文会变乱码，
+  更糟的是**连带把异常信息也吞掉**，让你看不到真正的错误。
+* **判据**：`sum(1 for b in open(f,'rb').read() if b > 127) == 0`。
+* **失效条件**：Linux 上的 Vivado 默认 UTF-8，此时非 ASCII 无害（但保留 ASCII 也无副作用）。
+
+### 规则 2：进 Block Design 的模块不得使用 `` `include ``
+
+* **范围**：会被 `create_bd_cell -type module -reference` 引用的模块。
+* **为什么**：BD 的 HDL 解析器不认 `include_dirs`，解析端口时 include 解不开。
+* **替代做法**：参数内联成字面量；真要共享常量，写成 Python 生成脚本（如 `gen_rom.py`）。
+* **失效条件**：纯 RTL 顶层（不经 BD）用 `include` 完全正常。
+
+### 规则 3：乘法必须显式扩宽到中间量（评审清单）
+
+* **范围**：任何"要保留高位"的乘法、除法、移位。
+* **为什么**：Verilog 的 `a * b` 位宽按 `max(左值, 操作数)` 计算，
+  `wire [15:0] y = a * b;` 会把乘积截断到 16 位。**不报错、不警告、仿真也看不出来**。
+* **正反例**：
+
+  ```verilog
+  // 错：3072*32767 在 16 位上下文里溢出
+  wire [15:0] p = (x * 16'd32767) / 16'sd3072;
+  // 对：先算到 48 位再收窄
+  wire signed [47:0] num = $signed({32'd0, x}) * 48'sd32767;
+  wire [15:0] p = num / 48'sd3072;
+  ```
+
+* **判据**：过一遍所有 `<=` 与 `assign` 右侧含 `*` 的赋值，问"乘积最大能到多少位"。
+* **失效条件**：这条**无法自动检查**。曾尝试写脚本扫描，但误报率过高（大量截断是设计意图），
+  最终放弃自动化，改为评审清单——见 `report/llm_collaboration.md` §4.5。
+
+### 规则 4：交付命令要按对方的 shell 写
+
+* **范围**：README、操作手册、任何让人复制粘贴的命令。
+* **为什么**：`cd /d` 是 cmd 专有；PowerShell 的 `cd` 不认 `/d`，
+  且**出于安全不执行当前目录下的程序**，必须写 `.\build_vivado.bat`。
+* **做法**：给出 cmd 与 PowerShell 两版；脚本内部用 `%~dp0` 推导路径，不依赖 cwd。
+* **失效条件**：无。但如果只给一版，**交付物在对方环境里就是不可用**。
+
+## 9. 技能包的边界：什么没有做成技能
+
+诚实记录三条"没能沉淀成技能"的东西，避免后来者误以为技能包覆盖了全部经验：
+
+| 未能沉淀的部分 | 原因 | 现在的处理方式 |
 |---|---|---|
-| 采样率 / 帧率（20 Hz） | `build/scripts/gen_rom.py` 的 `FS` | 同时影响相位增量与滤波器设计 |
-| FIR 频带与抽头数 | `gen_rom.py` 的 `BANDS` / `NTAP` | 改完必须重跑 `gen_rom.py` |
-| DFT 网格 | `gen_rom.py` 的 `grids` | 与 `bpm_map.v` 的网格定义必须同步 |
-| 窗口长度 / 通道数 | `src/rtl/frontend/radar_frame_if.v`（`ACQ_START` / `ACQ_LEN`）、`integrate_detrend.v`（`NSAMP` / `N_CH`） | 改长度要同步 `vs_engine_fsm.v` 的 `NPTS_RESP` |
-| 证书门限 | `src/rtl/cert/certificate_fsm.v` 里的字面量 | 对应 Python 的 `outlier_fraction_limit` 等 |
-| 运动阈值 / 默认值 | `src/rtl/top/vs_defaults.v` | 占位值集中在这一个文件 |
+| 位宽截断的自动检查 | 语法层面无法区分"该截断"与"截错" | 写成 SK-08 规则 3 的评审清单 |
+| 定点语义正确性（如 Q 格式选得对不对） | 需要对照浮点参考模型，无法从代码静态判定 | 靠 `report/design_report.md` 的定点规格表 + 逐模块仿真 |
+| 时序收敛的预判 | 依赖实现工具与器件，无法在生成阶段判断 | 给出"降频到 50 MHz"的兜底方案与余量估算 |
 
-**改参数的固定动作**：改 `gen_rom.py` → 重跑 → 重跑 `export_tables.py` 更新 `data/rom_tables/` →
-检查 `check_bd_nets.py` 仍为 0 问题 → 重建工程。
+**技能包的正确用法**：它覆盖的是**结构性、可复现**的错误（占比约 3/4），
+剩下的**语义性**错误必须靠评审与仿真。把这句话写进包里，比多写一条规则更重要。
 
-## 4. 改 RTL 的流程
+## 10. 换一个题目怎么用
 
-```
-1. 改 src/rtl/<layer>/<module>.v
-2. python sim/scripts/rtl_lint.py          # 结构 / 端口 / 保留字 / 字面量
-3. python sim/scripts/check_bd_nets.py     # 若端口名或位宽变了，BD 连线要同步
-4. 如果端口变了 -> 改 build/tcl/build_bd.tcl 里对应的 vs_net
-5. 新模块 -> 在 build_bd.tcl 里加一行 mkmod <module> <cell>，并加入 rtl_clk / rtl_rst 清单
-6. 需要验证功能 -> 补 sim/tb/tb_<module>.v，加进 sim/tcl/run_sim.tcl 的 tests 列表
-```
-
-**位宽陷阱（反复踩过）**：Verilog 的 `a * b` 位宽按 `max(左值, 操作数)` 计算，
-`wire [15:0] y = a * b;` 会把乘积截断到 16 位。任何要保留高位的乘法都必须先赋给足够宽的中间量：
-
-```verilog
-// 错：3072 * 32767 在 16 位上下文里溢出
-wire [15:0] y = (x * 16'd32767) / 16'sd3072;
-// 对：
-wire signed [47:0] num = $signed({32'd0, x}) * 48'sd32767;
-wire [15:0] y = num / 48'sd3072;
-```
-
-## 5. 改 Block Design 的流程
-
-`build/tcl/build_bd.tcl` 是**唯一事实来源**——它每次从头重建 BD，不要在 GUI 里改完就提交。
-
-```
-1. 加单元：在对应小节加 mkmod <module> <cell_name>
-2. 加时钟复位：把新 cell 名加进 rtl_clk 和 rtl_rst 两个列表
-3. 连线：用 vs_net <cellA>/<portA> <cellB>/<portB>
-        AXI-Stream 接口用 vs_link <cellA> <m_axis> <cellB> <s_axis>
-4. python sim/scripts/check_bd_nets.py     # 先本地预检，比开 Vivado 快 100 倍
-5. build_vivado.bat bd                     # 再真跑一遍，看 validate_bd_design
-```
-
-排错优先级：`!!` 引脚不存在 / 位宽不匹配 → `??` 悬空输入 → `BD 41-759` / `BD 41-1228`。
-
-**不要把"没有数据源"的输入真的悬空**：BD 会静默 tie 成 0，从日志看不出来。
-统一接到 `vs_defaults_0`，这样图上一眼能看出哪部分是占位。
-
-## 6. 换器件 / 换板卡
-
-1. `build/tcl/build_all.tcl` 的 `part` 改型号；
-2. PS7 的 DDR 型号、时钟频率、外设使能在 `build_bd.tcl` 的 `CONFIG.PCW_*` 里；
-3. HP0 数据宽度必须与 `axi_pc` 的 `DATA_WIDTH`、DMA 的 `c_m_axi_mm2s_data_width` 三者一致；
-4. 综合后看 `build/reports/synthesis_utilization_hier.rpt` 决定是否需要降频或裁剪通道数。
-
-## 7. 排障速查
-
-| 现象 | 真因 | 修法 |
+| 你的场景 | 直接用 | 需要改 |
 |---|---|---|
-| 脚本输出 `闃舵??` | `.tcl` 里有非 ASCII | 改成纯英文 |
-| `create_bd_cell` 失败且 `$e` 为空 | 模块里有 `` `include `` 或 HDL 语法错 | 内联参数；单独 `read_verilog` 该文件看报错 |
-| `Syntax error near "buf"` | 用了 Verilog 内建原语名当标识符 | 改名（`buf` → `samp_buf`） |
-| `Syntax error near "("` | `32'sd(NTAP-1)` 这种写法非法 | 先用 `localparam` 算好 |
-| `BD 41-1276 Parameter does not exist` | 属性名猜错（如 `SYNTH_CHECKPOINT_MODE`） | 先 `list_property` 枚举再 set |
-| `BD 41-1228` 位宽不匹配 | 连线两端位宽不同 | 改端口位宽，别靠自动截断 |
-| `BD 41-1285` 协议不兼容 | PS 的 HP 口是 AXI3、DMA 是 AXI4 | 中间插 `axi_protocol_converter`（S=AXI4, M=AXI3） |
-| `BD 41-758` 时钟脚未接 | Xilinx IP 的时钟脚名不是 `aclk` | 逐个显式连（`s_axi_lite_aclk` / `m_axi_mm2s_aclk` / `s_axi_aclk`…） |
-| `$readmemh: cannot open file` | `.mem` 没进工程或没设文件类型 | 检查 `build_all.tcl` 的 mem 列表 |
-| BRAM = 0、`LUT as Memory` 爆掉 | 大数组是组合读或声明成 `block` 却被当作 RAM | 见下条 |
-
-**存储器映射是资源的第一杀手**。同步读 + `ram_style="block"` 才能进 BRAM；
-组合读（同一拍读多个地址）必须用 `ram_style="distributed"`，否则综合器会用触发器实现，
-一个 600×80×24 bit 的窗口存储器会吃掉几万个 FF。
+| 另一个 Vivado Block Design 项目 | SK-01（改路径常量）、SK-04、SK-07 | 模块清单、连线表 |
+| 另一个纯 Verilog 项目 | SK-02、SK-08 规则 1/3 | 无 |
+| 另一个定点 DSP 项目 | SK-06、SK-08 规则 3 | 频带目标、Q 格式 |
+| 非 FPGA 项目（只借用协作方法） | SK-05 全部、SK-03 的"报错清单"组织形式 | 工具名、报错文本 |
